@@ -19,6 +19,7 @@ export interface Bounds3Box {
 export interface GaussianChunk {
   id?: string;
   url: string;
+  bytes?: number;
   splats?: number;
   center?: Vec3;
   bounds?: Bounds3Box;
@@ -43,6 +44,16 @@ export interface Pose3D {
 export interface SceneManifest {
   sceneId: string;
   frameId: string;
+  camera?: {
+    width?: number | null;
+    height?: number | null;
+    fx?: number | null;
+    fy?: number | null;
+    cx?: number | null;
+    cy?: number | null;
+    tCL?: number[] | null;
+    tBL?: number[] | null;
+  };
   gaussian?: GaussianSource;
   gaussianVariants?: Record<string, GaussianSource>;
   occupancy?: {

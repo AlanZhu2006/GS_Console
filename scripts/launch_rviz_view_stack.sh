@@ -23,4 +23,8 @@ if [[ "$READY" -ne 1 ]]; then
   exit 1
 fi
 
+if [[ "${LAUNCH_CAMERA_POSE_SIDECAR:-1}" == "1" ]]; then
+  bash "$ROOT_DIR/scripts/launch_saved_view_camera_pose_sidecar.sh" "$VIEW_CONTAINER"
+fi
+
 bash "$ROOT_DIR/scripts/launch_rviz_sidecar.sh" "$VIEW_CONTAINER"

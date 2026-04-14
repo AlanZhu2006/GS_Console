@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 IMAGE="${GS_SDF_IMAGE:-gs_sdf_img:latest}"
 OUTPUT_DIR="${1:-$ROOT_DIR/runtime/output/2026-04-02-23-01-07_fast_livo2_compressed.bag_fastlivo_cbd_host.yaml}"
 CONTAINER_NAME="${2:-gssdf-view}"
@@ -23,6 +23,10 @@ DATA_PATH=""
 DATA_MOUNT_ARGS=()
 MODEL_DIR="$OUTPUT_ABS/model"
 COMPAT_MODEL_DIR="$MODEL_DIR/model"
+VIEW_WIDTH="${VIEW_WIDTH:-}"
+VIEW_HEIGHT="${VIEW_HEIGHT:-}"
+VIEW_SCALE="${VIEW_SCALE:-}"
+KEEP_CONTAINER_ON_EXIT="${KEEP_CONTAINER_ON_EXIT:-0}"
 
 if [[ -f "$CONFIG_PATH" ]]; then
   DATA_PATH="$(sed -n 's/^data_path: "\(.*\)"/\1/p' "$CONFIG_PATH" | head -n 1)"
@@ -35,6 +39,26 @@ if [[ -n "$DATA_PATH" ]]; then
   fi
   DATA_PARENT="$(dirname "$(realpath "$DATA_PATH")")"
   DATA_MOUNT_ARGS=(-v "$DATA_PARENT:$DATA_PARENT")
+fi
+
+if [[ -n "$VIEW_WIDTH" || -n "$VIEW_HEIGHT" || -n "$VIEW_SCALE" ]]; then
+  RESOLUTION_ARGS=(--scene-config "$CONFIG_PATH")
+  if [[ -n "$VIEW_WIDTH" ]]; then
+    RESOLUTION_ARGS+=(--width "$VIEW_WIDTH")
+  fi
+  if [[ -n "$VIEW_HEIGHT" ]]; then
+    RESOLUTION_ARGS+=(--height "$VIEW_HEIGHT")
+  fi
+  if [[ -n "$VIEW_SCALE" ]]; then
+    RESOLUTION_ARGS+=(--scale "$VIEW_SCALE")
+  fi
+
+  echo "Applying GS-SDF view resolution override..."
+  docker run --rm \
+    -v "$ROOT_DIR:$ROOT_DIR" \
+    -v "$OUTPUT_PARENT:$OUTPUT_PARENT" \
+    "$IMAGE" \
+    python3 "$ROOT_DIR/scripts/override_gssdf_view_resolution.py" "${RESOLUTION_ARGS[@]}"
 fi
 
 # Some GS-SDF view-mode builds resolve occupancy assets under model/model/.
@@ -60,7 +84,12 @@ if [[ -n "$DATA_PATH" ]]; then
   echo "Data path:   $DATA_PATH"
 fi
 
-docker run -d --rm \
+DOCKER_RM_FLAG="--rm"
+if [[ "$KEEP_CONTAINER_ON_EXIT" == "1" ]]; then
+  DOCKER_RM_FLAG=""
+fi
+
+docker run -d $DOCKER_RM_FLAG \
   --name "$CONTAINER_NAME" \
   --gpus all \
   --shm-size=16g \
@@ -74,7 +103,13 @@ docker run -d --rm \
     roscore >/tmp/roscore.log 2>&1 & \
     ROSCORE_PID=\$!; \
     trap 'kill \$ROSCORE_PID >/dev/null 2>&1 || true' EXIT; \
-    sleep 3; \
+    for _ in \$(seq 1 60); do \
+      if rosparam list >/dev/null 2>&1; then \
+        break; \
+      fi; \
+      sleep 0.5; \
+    done; \
+    rosparam list >/dev/null 2>&1; \
     /root/gs_sdf_ws/devel/lib/neural_mapping/neural_mapping_node view \"$OUTPUT_ABS\""
 
 echo "Started $CONTAINER_NAME"

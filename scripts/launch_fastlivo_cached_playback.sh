@@ -1,17 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 IMAGE="${GS_SDF_IMAGE:-gs_sdf_img:latest}"
 CACHE_DIR="${1:-$ROOT_DIR/runtime/playback-cache/fast_livo2_compressed}"
 CONTAINER_NAME="${2:-fastlivo-cached-playback}"
 CONTROL_PORT="${CONTROL_PORT:-8765}"
-RATE="${RATE:-5.0}"
+RATE="${RATE:-1.0}"
 START_OFFSET="${START_OFFSET:-0}"
 LOOP="${LOOP:-0}"
 START_PAUSED="${START_PAUSED:-0}"
 MJPEG_MAX_FPS="${MJPEG_MAX_FPS:-60}"
+MAP_PUBLISH_EVERY="${MAP_PUBLISH_EVERY:-1}"
+WEB_MAP_MAX_POINTS="${WEB_MAP_MAX_POINTS:-48000}"
+WEB_SCAN_MAX_POINTS="${WEB_SCAN_MAX_POINTS:-8000}"
+MAP_FUSE_MAX_POINTS="${MAP_FUSE_MAX_POINTS:-6000}"
+SCAN_HISTORY_FRAMES="${SCAN_HISTORY_FRAMES:-6}"
+RESTORE_REPLAY_MAX_FRAMES="${RESTORE_REPLAY_MAX_FRAMES:-8}"
 STARTUP_TIMEOUT_SEC="${STARTUP_TIMEOUT_SEC:-60}"
+PLAYBACK_VIDEO_PATH="${PLAYBACK_VIDEO_PATH:-${PLAYBACK_VIDEO:-}}"
+PLAYBACK_VIDEO_FPS="${PLAYBACK_VIDEO_FPS:-12}"
+PLAYBACK_VIDEO_SPEED="${PLAYBACK_VIDEO_SPEED:-8}"
+PLAYBACK_VIDEO_START_OFFSET="${PLAYBACK_VIDEO_START_OFFSET:-0}"
+PLAYBACK_VIDEO_END_OFFSET="${PLAYBACK_VIDEO_END_OFFSET:--1}"
+PLAYBACK_VIDEO_LABEL="${PLAYBACK_VIDEO_LABEL:-}"
 
 if [[ ! -f "$CACHE_DIR/meta.json" ]]; then
   echo "Playback cache metadata does not exist: $CACHE_DIR/meta.json" >&2
@@ -19,7 +31,7 @@ if [[ ! -f "$CACHE_DIR/meta.json" ]]; then
 fi
 
 abspath_preserve() {
-  python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"
+  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
 }
 
 CACHE_ABS="$(abspath_preserve "$CACHE_DIR")"
@@ -36,7 +48,16 @@ echo "Start:         $START_OFFSET s"
 echo "Loop:          $LOOP"
 echo "Paused:        $START_PAUSED"
 echo "MJPEG max fps: $MJPEG_MAX_FPS"
+echo "Map publish:   every ${MAP_PUBLISH_EVERY} frame(s)"
+echo "Web map pts:   $WEB_MAP_MAX_POINTS"
+echo "Web scan pts:  $WEB_SCAN_MAX_POINTS"
+echo "Map fuse pts:  $MAP_FUSE_MAX_POINTS (per frame, 0=no cap)"
+echo "Scan history:  $SCAN_HISTORY_FRAMES frame(s)"
+echo "Seek replay:   $RESTORE_REPLAY_MAX_FRAMES frame(s)"
 echo "Startup wait:  ${STARTUP_TIMEOUT_SEC}s"
+if [[ -n "$PLAYBACK_VIDEO_PATH" ]]; then
+  echo "Video path:    $PLAYBACK_VIDEO_PATH"
+fi
 
 KEEP_CONTAINER_ON_EXIT="${KEEP_CONTAINER_ON_EXIT:-0}"
 DOCKER_RM_FLAG="--rm"
@@ -46,6 +67,7 @@ fi
 
 docker run -d $DOCKER_RM_FLAG \
   --name "$CONTAINER_NAME" \
+  --hostname "$CONTAINER_NAME" \
   -p "$CONTROL_PORT:$CONTROL_PORT" \
   -v "$ROOT_DIR:$ROOT_DIR" \
   -v "$CACHE_PARENT:$CACHE_PARENT" \
@@ -55,7 +77,13 @@ docker run -d $DOCKER_RM_FLAG \
     roscore >/tmp/roscore.log 2>&1 & \
     ROSCORE_PID=\$!; \
     trap 'kill \$ROSCORE_PID >/dev/null 2>&1 || true' EXIT; \
-    sleep 3; \
+    for _ in \$(seq 1 60); do \
+      if rosparam list >/dev/null 2>&1; then \
+        break; \
+      fi; \
+      sleep 0.5; \
+    done; \
+    rosparam list >/dev/null 2>&1; \
     rosparam set use_sim_time true; \
     python3 '$ROOT_DIR/scripts/fastlivo_cached_playback_server.py' \
       --cache-dir '$CACHE_ABS' \
@@ -65,6 +93,14 @@ docker run -d $DOCKER_RM_FLAG \
       --container-name '$CONTAINER_NAME' \
       --image-name '$IMAGE' \
       --mjpeg-max-fps '$MJPEG_MAX_FPS' \
+      --map-publish-every '$MAP_PUBLISH_EVERY' \
+      --map-fuse-max-points '$MAP_FUSE_MAX_POINTS' \
+      --scan-history-frames '$SCAN_HISTORY_FRAMES' \
+      --restore-replay-max-frames '$RESTORE_REPLAY_MAX_FRAMES' \
+      --web-map-max-points '$WEB_MAP_MAX_POINTS' \
+      --web-scan-max-points '$WEB_SCAN_MAX_POINTS' \
+      $([[ -n "$PLAYBACK_VIDEO_PATH" ]] && printf -- "--video-path '%s' --video-fps '%s' --video-speed '%s' --video-start-offset '%s' --video-end-offset '%s'" "$PLAYBACK_VIDEO_PATH" "$PLAYBACK_VIDEO_FPS" "$PLAYBACK_VIDEO_SPEED" "$PLAYBACK_VIDEO_START_OFFSET" "$PLAYBACK_VIDEO_END_OFFSET") \
+      $([[ -n "$PLAYBACK_VIDEO_LABEL" ]] && printf -- " --video-label '%s'" "$PLAYBACK_VIDEO_LABEL") \
       $([[ "$LOOP" == "1" ]] && printf '%s' '--loop') \
       $([[ "$START_PAUSED" == "1" ]] && printf '%s' '--paused')"
 

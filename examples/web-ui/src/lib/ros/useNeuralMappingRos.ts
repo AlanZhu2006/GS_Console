@@ -21,6 +21,7 @@ export interface PlaybackCloudOptions {
 
 interface RosHookOptions {
   playbackCloud?: Partial<PlaybackCloudOptions>;
+  playbackTargetStampMs?: number | null;
 }
 
 export interface RosLiveState {
@@ -118,8 +119,10 @@ export function useNeuralMappingRos(wsUrl: string, options?: RosHookOptions): Ro
   const playbackCloudTickRef = useRef(0);
   const playbackSidecarMapActiveRef = useRef(false);
   const playbackSidecarScanActiveRef = useRef(false);
+  const playbackScanHistoryRef = useRef<DecodedPointCloud[]>([]);
   const lastPlaybackOdomStampRef = useRef<number | null>(null);
   const lastPlaybackCloudStampRef = useRef<number | null>(null);
+  const playbackTargetStampMsRef = useRef<number | null>(options?.playbackTargetStampMs ?? null);
   const playbackCloudOptions = useMemo(
     () => ({
       ...defaultPlaybackCloudOptions,
@@ -130,10 +133,26 @@ export function useNeuralMappingRos(wsUrl: string, options?: RosHookOptions): Ro
   const playbackCloudOptionsRef = useRef<PlaybackCloudOptions>(playbackCloudOptions);
 
   useEffect(() => {
+    playbackTargetStampMsRef.current = options?.playbackTargetStampMs ?? null;
+    if (!playbackSidecarScanActiveRef.current) {
+      return;
+    }
+    const selectedScan = selectPlaybackScanForTarget(
+      playbackScanHistoryRef.current,
+      playbackTargetStampMsRef.current
+    );
+    setPlaybackScanPointCloud(selectedScan);
+  }, [options?.playbackTargetStampMs]);
+
+  useEffect(() => {
     playbackCloudOptionsRef.current = playbackCloudOptions;
+    if (playbackSidecarMapActiveRef.current || playbackSidecarScanActiveRef.current) {
+      return;
+    }
     playbackCloudVoxelsRef.current = new Map();
     playbackCloudOrderRef.current = [];
     playbackCloudTickRef.current = 0;
+    playbackScanHistoryRef.current = [];
     lastPlaybackCloudStampRef.current = null;
     playbackWebCloudActiveUntilRef.current = 0;
     playbackSidecarMapActiveRef.current = false;
@@ -149,6 +168,7 @@ export function useNeuralMappingRos(wsUrl: string, options?: RosHookOptions): Ro
     playbackCloudVoxelsRef.current = new Map();
     playbackCloudOrderRef.current = [];
     playbackCloudTickRef.current = 0;
+    playbackScanHistoryRef.current = [];
     lastPlaybackOdomStampRef.current = null;
     lastPlaybackCloudStampRef.current = null;
     playbackWebCloudActiveUntilRef.current = 0;
@@ -228,7 +248,7 @@ export function useNeuralMappingRos(wsUrl: string, options?: RosHookOptions): Ro
       ros: client,
       name: "/cloud_registered_body_web",
       messageType: "sensor_msgs/PointCloud2",
-      throttle_rate: 80,
+      throttle_rate: 45,
       queue_length: 1,
       compression: "none"
     });
@@ -237,25 +257,25 @@ export function useNeuralMappingRos(wsUrl: string, options?: RosHookOptions): Ro
       ros: client,
       name: "/origin_img",
       messageType: "sensor_msgs/Image",
-      throttle_rate: 120,
+      throttle_rate: 70,
       queue_length: 1,
       compression: "png"
     });
 
     const playbackGlobalMapTopic = new ROSLIB.Topic({
       ros: client,
-      name: "/fastlivo/global_map",
+      name: "/fastlivo/global_map_web",
       messageType: "sensor_msgs/PointCloud2",
-      throttle_rate: 220,
+      throttle_rate: 55,
       queue_length: 1,
       compression: "none"
     });
 
     const playbackCurrentScanWorldTopic = new ROSLIB.Topic({
       ros: client,
-      name: "/fastlivo/current_scan_world",
+      name: "/fastlivo/current_scan_world_web",
       messageType: "sensor_msgs/PointCloud2",
-      throttle_rate: 90,
+      throttle_rate: 35,
       queue_length: 1,
       compression: "none"
     });
@@ -336,7 +356,7 @@ export function useNeuralMappingRos(wsUrl: string, options?: RosHookOptions): Ro
           return;
         }
 
-        playbackTrajectoryRef.current = [...playbackTrajectoryRef.current.slice(-799), pose];
+        playbackTrajectoryRef.current = [...playbackTrajectoryRef.current.slice(-2047), pose];
         lastPlaybackPoseRef.current = pose;
         setTrajectory(playbackTrajectoryRef.current);
       });
@@ -436,7 +456,7 @@ export function useNeuralMappingRos(wsUrl: string, options?: RosHookOptions): Ro
         try {
           setStreamProfile("playback");
           const decoded = decodePointCloud2(message as PointCloud2Message, {
-            maxPoints: 120_000
+            maxPoints: 80_000
           });
           const previousStampMs = lastPlaybackCloudStampRef.current;
           if (previousStampMs !== null && (decoded.stampMs ?? 0) + 400 < previousStampMs) {
@@ -459,10 +479,18 @@ export function useNeuralMappingRos(wsUrl: string, options?: RosHookOptions): Ro
         try {
           setStreamProfile("playback");
           const decoded = decodePointCloud2(message as PointCloud2Message, {
-            maxPoints: 24_000
+            maxPoints: 16_000
           });
           playbackSidecarScanActiveRef.current = true;
-          setPlaybackScanPointCloud(decoded);
+          playbackScanHistoryRef.current = appendPlaybackScanHistory(
+            playbackScanHistoryRef.current,
+            decoded
+          );
+          const selectedScan = selectPlaybackScanForTarget(
+            playbackScanHistoryRef.current,
+            playbackTargetStampMsRef.current ?? latestPlaybackPoseRef.current?.stampMs ?? null
+          );
+          setPlaybackScanPointCloud(selectedScan);
         } catch (error) {
           console.warn("Failed to decode sidecar playback current scan from rosbridge.", error);
         }
@@ -601,12 +629,84 @@ function shouldAppendPlaybackPose(lastPose: Pose3D | null, nextPose: Pose3D): bo
     return true;
   }
 
-  const dt = Math.abs((nextPose.stampMs ?? 0) - (lastPose.stampMs ?? 0));
+  const nextStampMs = nextPose.stampMs ?? 0;
+  const lastStampMs = lastPose.stampMs ?? 0;
+  const dt = Math.abs(nextStampMs - lastStampMs);
   const dx = nextPose.position.x - lastPose.position.x;
   const dy = nextPose.position.y - lastPose.position.y;
   const dz = nextPose.position.z - lastPose.position.z;
+  const yawDelta = Math.abs(normalizeAngle(quaternionToYaw(nextPose.orientation) - quaternionToYaw(lastPose.orientation)));
 
-  return dt >= 180 || Math.hypot(dx, dy, dz) >= 0.08;
+  if (nextStampMs <= lastStampMs && Math.hypot(dx, dy, dz) < 1e-3 && yawDelta < 0.01) {
+    return false;
+  }
+
+  return dt >= 45 || Math.hypot(dx, dy, dz) >= 0.025 || yawDelta >= 0.04;
+}
+
+function appendPlaybackScanHistory(
+  history: DecodedPointCloud[],
+  nextCloud: DecodedPointCloud
+): DecodedPointCloud[] {
+  const nextStampMs = nextCloud.stampMs ?? 0;
+  const trimmed = history.filter((cloud) => {
+    const stampMs = cloud.stampMs ?? 0;
+    return nextStampMs <= 0 || stampMs >= nextStampMs - 1_200;
+  });
+  const last = trimmed[trimmed.length - 1];
+  if (last && Math.abs((last.stampMs ?? 0) - nextStampMs) <= 1) {
+    trimmed[trimmed.length - 1] = nextCloud;
+    return trimmed;
+  }
+  trimmed.push(nextCloud);
+  return trimmed.slice(-36);
+}
+
+function selectPlaybackScanForTarget(
+  history: DecodedPointCloud[],
+  targetStampMs: number | null
+): DecodedPointCloud | null {
+  if (history.length < 1) {
+    return null;
+  }
+  if (!targetStampMs) {
+    return history[history.length - 1] ?? null;
+  }
+
+  let best: DecodedPointCloud | null = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const cloud = history[index];
+    const distance = Math.abs((cloud.stampMs ?? 0) - targetStampMs);
+    if (distance <= bestDistance) {
+      best = cloud;
+      bestDistance = distance;
+    }
+  }
+
+  if (!best) {
+    return null;
+  }
+
+  return bestDistance <= 220 ? best : null;
+}
+
+function quaternionToYaw(orientation: Pose3D["orientation"]): number {
+  const { x, y, z, w } = orientation;
+  const siny = 2 * (w * z + x * y);
+  const cosy = 1 - 2 * (y * y + z * z);
+  return Math.atan2(siny, cosy);
+}
+
+function normalizeAngle(angle: number): number {
+  let normalized = angle;
+  while (normalized > Math.PI) {
+    normalized -= Math.PI * 2;
+  }
+  while (normalized < -Math.PI) {
+    normalized += Math.PI * 2;
+  }
+  return normalized;
 }
 
 function accumulatePlaybackCloud(
@@ -811,13 +911,13 @@ function appendPlaybackRgbFrame(
   nextFrame: DecodedRosImage
 ): DecodedRosImage[] {
   const nextFrames = [...frames, nextFrame];
-  return nextFrames.slice(-24);
+  return nextFrames.slice(-80);
 }
 
 function selectPlaybackRgbFrame(
   frames: DecodedRosImage[],
   stampMs: number,
-  toleranceMs = 220
+  toleranceMs = 140
 ): DecodedRosImage | null {
   if (!frames.length) {
     return null;

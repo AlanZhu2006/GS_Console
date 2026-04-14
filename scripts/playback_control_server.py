@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--container-name", default="fastlivo-playback")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--image", default=os.environ.get("GS_SDF_IMAGE", "gs_sdf_img:latest"))
-    parser.add_argument("--default-rate", type=float, default=16.0)
+    parser.add_argument("--default-rate", type=float, default=1.0)
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--rosbridge-port", type=int, default=9090)
     return parser.parse_args()

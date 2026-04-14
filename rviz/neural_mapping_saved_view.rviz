@@ -81,25 +81,25 @@ Visualization Manager:
     - Class: rviz/Image
       Enabled: true
       Image Rendering: background and overlay
+      Image Topic: /neural_mapping/rgb
       Max Value: 1
       Median window: 5
       Min Value: 0
       Name: RGB
       Normalize Range: true
       Queue Size: 2
-      Topic: /neural_mapping/rgb
       Transport Hint: raw
       Value: true
     - Class: rviz/Image
       Enabled: false
       Image Rendering: background and overlay
+      Image Topic: /neural_mapping/depth
       Max Value: 10
       Median window: 5
       Min Value: 0
       Name: Depth
       Normalize Range: true
       Queue Size: 2
-      Topic: /neural_mapping/depth
       Transport Hint: raw
       Value: false
   Enabled: true

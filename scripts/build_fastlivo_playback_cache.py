@@ -238,6 +238,7 @@ def main() -> None:
             max_range=float(args.web_max_range),
             max_abs_z=float(args.web_max_abs_z),
             sync_tolerance=float(args.image_sync_tolerance),
+            neutral_when_image_unavailable=True,
         )
         if scan_positions_lidar.size == 0:
             continue

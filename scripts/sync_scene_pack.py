@@ -66,6 +66,44 @@ def parse_scene_meta(config_path: Path):
     return meta
 
 
+def parse_camera_config(config_path: Path):
+    camera = {
+        "width": None,
+        "height": None,
+        "fx": None,
+        "fy": None,
+        "cx": None,
+        "cy": None,
+        "tCL": None,
+        "tBL": None,
+    }
+    if not config_path or not config_path.is_file():
+        return camera
+
+    text = config_path.read_text()
+    for key in ("width", "height", "fx", "fy", "cx", "cy"):
+        match = re.search(rf"{key}:\s*([0-9.+-eE]+)", text)
+        if match:
+            camera[key] = float(match.group(1))
+
+    def parse_matrix(name: str):
+        match = re.search(
+            rf"{name}:\s*!!opencv-matrix.*?data:\s*\[(.*?)\]",
+            text,
+            re.DOTALL,
+        )
+        if not match:
+            return None
+        values = [float(token.strip()) for token in match.group(1).replace("\n", " ").split(",") if token.strip()]
+        if len(values) != 16:
+            return None
+        return values
+
+    camera["tCL"] = parse_matrix("T_C_L")
+    camera["tBL"] = parse_matrix("T_B_L")
+    return camera
+
+
 def safe_link(src: Path, dst: Path):
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.is_symlink() or dst.exists():
@@ -117,6 +155,7 @@ def build_chunk_source(chunks_manifest, args, scene_id: str, model_root: Path, v
                 "id": chunk.get("id"),
                 "url": f"{args.url_prefix}/{scene_id}/model/{chunk_dir_name}/{chunk['file']}",
                 "splats": chunk.get("splats"),
+                "bytes": chunk.get("bytes", src.stat().st_size),
                 "center": chunk.get("center"),
                 "bounds": chunk.get("bounds"),
             }
@@ -148,6 +187,7 @@ def main():
           config_path = fallback
 
     meta = parse_scene_meta(config_path) if config_path else parse_scene_meta(Path())
+    camera = parse_camera_config(config_path) if config_path else parse_camera_config(Path())
 
     repo_root = Path(__file__).resolve().parent.parent
     processed_model_root = repo_root / "runtime" / "processed" / output_dir.name / "model"
@@ -194,6 +234,7 @@ def main():
             "mapOrigin": meta["map_origin"],
             "mapSize": meta["map_size"],
         },
+        "camera": camera,
         "assets": {},
     }
 
@@ -217,7 +258,7 @@ def main():
         )
 
     if gaussian_variants:
-        preferred_variants = ["quality", "balanced", "fast"]
+        preferred_variants = ["quality", "balanced", "ultra", "fast"]
         default_variant = next(
             (variant for variant in preferred_variants if variant in gaussian_variants),
             sorted(gaussian_variants.keys())[0],

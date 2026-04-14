@@ -12,9 +12,17 @@ if ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
   bash "$ROOT_DIR/scripts/build_ros_tools_image.sh" "$IMAGE_TAG"
 fi
 
-ROS_MASTER_HOST="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$SOURCE_CONTAINER")"
-SOURCE_HOSTNAME="$(docker inspect -f '{{.Config.Hostname}}' "$SOURCE_CONTAINER")"
-if [[ -z "$ROS_MASTER_HOST" ]]; then
+ROS_MASTER_HOST=""
+SOURCE_HOSTNAME=""
+for ((i=0; i<WAIT_SECONDS; i++)); do
+  ROS_MASTER_HOST="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$SOURCE_CONTAINER" 2>/dev/null || true)"
+  SOURCE_HOSTNAME="$(docker inspect -f '{{.Config.Hostname}}' "$SOURCE_CONTAINER" 2>/dev/null || true)"
+  if [[ -n "$ROS_MASTER_HOST" && "$ROS_MASTER_HOST" != "<no value>" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ -z "$ROS_MASTER_HOST" || "$ROS_MASTER_HOST" == "<no value>" ]]; then
   echo "Failed to resolve ROS master container IP from $SOURCE_CONTAINER" >&2
   exit 1
 fi
@@ -40,6 +48,7 @@ docker run -d \
   --network bridge \
   -p "$HOST_PORT:9090" \
   -e ROS_MASTER_URI="http://$ROS_MASTER_HOST:11311" \
+  --add-host "$SOURCE_CONTAINER:$ROS_MASTER_HOST" \
   --add-host "$SOURCE_HOSTNAME:$ROS_MASTER_HOST" \
   "$IMAGE_TAG" \
   bash -lc "export ROS_IP=\$(hostname -I | awk '{print \$1}'); source /opt/ros/noetic/setup.bash && roslaunch rosbridge_server rosbridge_websocket.launch address:=0.0.0.0 port:=9090"

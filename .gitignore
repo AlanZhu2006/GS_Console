@@ -29,3 +29,6 @@ examples/web-ui/public/scenes/*
 
 # Local scratch / commands
 command.txt
+
+# Large local assets
+cbd_gs.ply

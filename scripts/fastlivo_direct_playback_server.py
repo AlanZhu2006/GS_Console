@@ -30,6 +30,7 @@ TOPICS = ("/aft_mapped_to_init", "/cloud_registered_body", "/origin_img")
 WEB_POINT_TOPIC = "/cloud_registered_body_web"
 CURRENT_SCAN_WORLD_TOPIC = "/fastlivo/current_scan_world"
 GLOBAL_MAP_TOPIC = "/fastlivo/global_map"
+RGB_NEUTRAL_FALLBACK = (164, 169, 178)
 
 
 @dataclass
@@ -69,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bag-path", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--default-rate", type=float, default=5.0)
+    parser.add_argument("--default-rate", type=float, default=1.0)
     parser.add_argument("--start-offset", type=float, default=0.0)
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--paused", action="store_true")
@@ -216,6 +217,7 @@ def extract_scan_points(
     max_range: float,
     max_abs_z: float,
     sync_tolerance: float,
+    neutral_when_image_unavailable: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     source_count = max(int(message.width) * max(int(message.height), 1), 1)
     voxel_size = max(float(voxel_size), 1e-3)
@@ -260,11 +262,13 @@ def extract_scan_points(
 
         if image_ok:
             rgb = project_rgb((x, y, z), latest_image, calibration)
+            if rgb is None:
+                rgb = RGB_NEUTRAL_FALLBACK
         else:
-            rgb = None
-
-        if rgb is None:
-            rgb = intensity_color(intensity if math.isfinite(intensity) else 0.5)
+            if neutral_when_image_unavailable:
+                rgb = RGB_NEUTRAL_FALLBACK
+            else:
+                rgb = intensity_color(intensity if math.isfinite(intensity) else 0.5)
 
         positions.append((x, y, z))
         colors.append(rgb)
@@ -477,12 +481,12 @@ class DirectPlaybackController:
                 return max(0.0, min(offset, duration_sec))
 
             elapsed = max(0.0, time.monotonic() - self.session_start_wall)
-            estimated = self.session_start_offset + elapsed * max(self.rate, 0.1)
+            wall_estimated = self.session_start_offset + elapsed * max(self.rate, 0.1)
             if self.loop and duration_sec > 0:
-                estimated %= duration_sec
+                wall_estimated %= duration_sec
             else:
-                estimated = min(estimated, duration_sec)
-            return max(offset, estimated)
+                wall_estimated = min(wall_estimated, duration_sec)
+            return min(wall_estimated, offset)
 
     def status(self) -> dict[str, Any]:
         with self.lock:

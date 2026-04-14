@@ -188,6 +188,10 @@ input {
   overflow: hidden;
 }
 
+.workspace.showcase-playback {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .main-column {
   min-width: 0;
   display: grid;
@@ -209,9 +213,263 @@ input {
   box-shadow: 0 22px 60px rgba(0, 0, 0, 0.28);
 }
 
+.viewer-panel.showcase-viewer {
+  border-color: rgba(195, 179, 151, 0.45);
+  background: linear-gradient(180deg, rgba(248, 246, 239, 0.98), rgba(242, 239, 230, 0.99));
+}
+
 .viewer-panel.compare-layout {
   display: grid;
   grid-template-columns: minmax(0, 1.3fr) minmax(19rem, 0.7fr);
+}
+
+.viewer-panel.playback-split-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(22rem, 0.8fr);
+}
+
+.viewer-panel.playback-cinema-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  align-items: stretch;
+  gap: 0.75rem;
+  min-height: 0;
+}
+
+.playback-cinema-map-stage {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  border-radius: 1.4rem;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(10, 12, 16, 0.92);
+}
+
+.playback-cinema-viewer-host {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+  white-space: nowrap;
+}
+
+/* HiFi cinema tile: fill with MJPEG; keep a 1px WebGL canvas for LiveGsViewer without stealing layout. */
+.playback-gs-hifi-stack {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.playback-gs-hifi-stack .playback-mjpeg,
+.playback-gs-hifi-stack .feed-empty {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.playback-gs-hifi-stack .playback-cinema-viewer-host {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+}
+
+.playback-gs-webgs-frame {
+  display: flex;
+  flex-direction: column;
+}
+
+.playback-webgs-viewer-host {
+  flex: 1 1 0;
+  min-height: 8rem;
+  position: relative;
+}
+
+.playback-webgs-viewer-host .main-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.playback-cinema-map-overlay {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.75rem;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.playback-cinema-map-overlay .overlay-chip-row {
+  pointer-events: auto;
+}
+
+.playback-cinema-map-layer {
+  position: relative;
+  z-index: 1;
+  flex: 1 1 0;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.playback-map-shell {
+  flex: 1 1 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 0.9rem;
+  overflow: hidden;
+}
+
+.playback-map-shell-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.85rem;
+  flex-wrap: wrap;
+}
+
+.playback-map-shell-body {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  overflow: hidden;
+}
+
+.playback-map-shell-body > *:not(.mini-map-playback-rail) {
+  flex-shrink: 0;
+}
+
+.playback-map-shell .mini-map.mini-map-playback-rail {
+  flex: 1 1 0;
+  min-height: 0;
+  height: 100%;
+  max-height: none;
+}
+
+.playback-stream-rail {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0.85rem 1rem 1rem;
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(10, 12, 16, 0.72);
+  border-radius: 0 1.4rem 1.4rem 0;
+}
+
+.playback-stream-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.playback-stream-title {
+  margin-top: 0.15rem;
+  font-size: 0.98rem;
+  font-weight: 700;
+}
+
+.playback-stream-stack {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  margin-top: 0.75rem;
+}
+
+.playback-stream-tile {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.playback-mjpeg-frame {
+  flex: 1 1 0;
+  min-height: 0;
+  border-radius: 0.9rem;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: #0c1015;
+}
+
+.playback-mjpeg {
+  width: 100%;
+  height: 100%;
+  min-height: 8rem;
+  object-fit: contain;
+  display: block;
+  background: #0c1015;
+}
+
+.playback-stream-video-wrap {
+  flex: 1 1 0;
+  min-height: 0;
+  margin-top: 0.75rem;
+  border-radius: 0.9rem;
+  overflow: hidden;
+}
+
+.playback-stream-video-wrap-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.playback-stream-video-wrap .compare-video {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+}
+
+.playback-hidden-master-video {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.playback-master-video-hidden {
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.playback-stream-hint {
+  margin-top: 0.6rem;
+  margin-bottom: 0;
+  flex-shrink: 0;
 }
 
 .viewer-stage {
@@ -221,11 +479,53 @@ input {
   height: 100%;
 }
 
+.viewer-stage.showcase-stage .main-canvas {
+  filter: saturate(1.04) contrast(1.02);
+}
+
 .main-canvas,
 .topdown-canvas {
   width: 100%;
   height: 100%;
   display: block;
+}
+
+.viewer-stage.hifi-stage .main-canvas {
+  position: relative;
+  z-index: 2;
+  opacity: 0;
+  pointer-events: auto;
+}
+
+.main-remote-surface {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: #0b0f14;
+  pointer-events: none;
+}
+
+.main-remote-stream {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+  background: #0b0f14;
+  pointer-events: none;
+}
+
+.main-remote-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+  text-align: center;
+  color: #c7c0b5;
+  font-size: 0.95rem;
+  background:
+    radial-gradient(circle at center, rgba(215, 155, 89, 0.08), transparent 30%),
+    #0b0f14;
 }
 
 .viewer-overlay {
@@ -243,6 +543,11 @@ input {
 .viewer-overlay.top-right {
   top: 1rem;
   right: 1rem;
+}
+
+.viewer-overlay.bottom-left {
+  left: 1rem;
+  bottom: 1rem;
 }
 
 .viewer-overlay.bottom-right {
@@ -284,6 +589,19 @@ input {
   display: flex;
   gap: 0.5rem;
   flex-wrap: wrap;
+}
+
+.compact-overlay-toggle {
+  padding: 0.18rem;
+  border-radius: 999px;
+  background: rgba(10, 14, 18, 0.74);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(14px);
+}
+
+.compact-overlay-toggle .segmented-option {
+  padding: 0.4rem 0.72rem;
+  font-size: 0.74rem;
 }
 
 .overlay-chip {
@@ -356,6 +674,10 @@ input {
   padding-right: 0.15rem;
 }
 
+.workspace.showcase-playback .sidebar {
+  display: none;
+}
+
 .compare-rail {
   display: grid;
   gap: 1rem;
@@ -372,6 +694,85 @@ input {
   border-radius: 1rem;
   background: rgba(255, 255, 255, 0.035);
   border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.playback-compare-stage {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 1rem;
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(10, 12, 16, 0.68);
+}
+
+.playback-compare-card {
+  display: grid;
+  align-content: start;
+  gap: 0.85rem;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+.playback-map-dock {
+  flex: 1 1 0;
+  min-width: 0;
+  /* Without a floor, flex siblings can shrink this to 0 next to a tall compare card. */
+  min-height: min(36vh, 22rem);
+  margin-top: 0.85rem;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/*
+ * <details> + column flex is unreliable across browsers. Grid rows (auto + 1fr) correctly
+ * reserves space for .panel-body so the 2D map canvas gets a non-zero height.
+ */
+.playback-map-dock > .inspector-section {
+  flex: 1 1 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.playback-map-dock > .inspector-section > summary {
+  align-self: start;
+}
+
+.playback-map-dock .panel-body {
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.playback-map-dock .panel-body > *:not(.mini-map-playback-rail) {
+  flex-shrink: 0;
+}
+
+.playback-map-dock .mini-map-playback-rail {
+  flex: 1 1 auto;
+  min-height: 14rem;
+  /* Fill row from grid; avoid height:auto collapsing when parent flex is ambiguous */
+  height: 100%;
+}
+
+.playback-compare-header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 0.85rem;
+  flex-wrap: wrap;
+}
+
+.playback-compare-title {
+  margin-top: 0.15rem;
+  font-size: 0.98rem;
+  font-weight: 700;
 }
 
 .compare-header,
@@ -542,6 +943,10 @@ input {
   flex-shrink: 0;
 }
 
+.timeline-dock.showcase-timeline {
+  border-color: rgba(195, 179, 151, 0.28);
+}
+
 .timeline-primary {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -663,6 +1068,16 @@ input {
   gap: 0.8rem;
 }
 
+.playback-compare-grid {
+  grid-template-columns: 1fr;
+}
+
+.sync-compare-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
 .feed-tile {
   display: grid;
   gap: 0.5rem;
@@ -684,12 +1099,182 @@ input {
   background: rgba(255, 255, 255, 0.035);
 }
 
+.feed-frame.compare-frame {
+  min-height: 0;
+  aspect-ratio: 4 / 3;
+  background:
+    linear-gradient(180deg, rgba(13, 15, 18, 0.82), rgba(10, 11, 13, 0.92)),
+    #0c1015;
+}
+
 .feed-frame img {
   display: block;
   width: 100%;
   height: 100%;
   object-fit: cover;
   background: #0c1015;
+}
+
+.compare-frame img {
+  object-fit: contain;
+}
+
+.smooth-image {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.smooth-image-layer {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: inherit;
+  opacity: 1;
+  transition: opacity 180ms ease;
+  background: #0c1015;
+}
+
+.smooth-image-layer.fade-base {
+  opacity: 0.72;
+}
+
+.smooth-image-layer.incoming {
+  opacity: 0;
+}
+
+.smooth-image-layer.incoming.visible {
+  opacity: 1;
+}
+
+.showcase-inset-wrap {
+  pointer-events: none;
+}
+
+.showcase-inset-card {
+  width: min(25vw, 19rem);
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.65rem;
+  border-radius: 1rem;
+  background: rgba(10, 14, 18, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(14px);
+}
+
+.showcase-inset-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-size: 0.82rem;
+}
+
+.showcase-inset-header span {
+  color: #d9d0c4;
+}
+
+.showcase-inset-frame {
+  aspect-ratio: 5 / 3;
+  overflow: hidden;
+  border-radius: 0.9rem;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.showcase-inset-frame img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.showcase-video-mirror {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #0c1015;
+}
+
+.showcase-inset-frame .smooth-image-layer {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.compare-mode-toggle {
+  margin-bottom: 0.75rem;
+}
+
+.playback-compare-header .compare-mode-toggle {
+  margin-bottom: 0;
+}
+
+.video-frame {
+  min-height: 0;
+  aspect-ratio: 5 / 2;
+}
+
+.compare-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #0c1015;
+}
+
+@media (max-width: 1520px) {
+  .viewer-panel.playback-split-layout {
+    grid-template-columns: minmax(0, 1fr) minmax(19rem, 0.72fr);
+  }
+}
+
+@media (max-width: 1220px) {
+  .viewer-panel.playback-split-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .viewer-panel.playback-cinema-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .playback-cinema-map-stage {
+    border-radius: 1.4rem 1.4rem 0 0;
+    min-height: min(42vh, 28rem);
+  }
+
+  .playback-stream-rail {
+    border-left: 0;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 0 0 1.4rem 1.4rem;
+    max-height: min(52vh, 36rem);
+    overflow-y: auto;
+  }
+
+  .playback-compare-stage {
+    border-left: 0;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    max-height: min(70vh, 52rem);
+    overflow-y: auto;
+  }
+
+  .playback-map-dock {
+    flex: 0 0 auto;
+    min-height: 24rem;
+  }
+
+  .playback-map-dock .mini-map-playback-rail {
+    flex: 0 0 auto;
+    height: 18rem;
+  }
+}
+
+.compare-feed-note {
+  grid-column: 1 / -1;
+  margin-top: 0;
 }
 
 .feed-canvas {
@@ -708,6 +1293,13 @@ input {
   text-align: center;
   color: #bdb5aa;
   font-size: 0.88rem;
+}
+
+@media (max-width: 1024px) {
+  .playback-compare-grid,
+  .sync-compare-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .toggle-list {

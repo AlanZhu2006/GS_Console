@@ -43,6 +43,8 @@ export const defaultPlaybackCalibration: PlaybackProjectionCalibration = {
   }
 };
 
+const PLAYBACK_RGB_SYNC_WINDOW_MS = 40;
+
 export function projectPlaybackCloudToWorld(
   cloud: DecodedPointCloud,
   poseWB: Pose3D | null,
@@ -60,7 +62,7 @@ export function projectPlaybackCloudToWorld(
   const tCL = calibration.extrinsic.tCL;
   const useRgbFrame =
     rgbFrame &&
-    Math.abs((rgbFrame.stampMs ?? 0) - (cloud.stampMs ?? 0)) <= 240 &&
+    Math.abs((rgbFrame.stampMs ?? 0) - (cloud.stampMs ?? 0)) <= PLAYBACK_RGB_SYNC_WINDOW_MS &&
     rgbFrame.width > 0 &&
     rgbFrame.height > 0
       ? rgbFrame
@@ -125,18 +127,25 @@ function sampleProjectedColor(
 
   const u = camera.fx * (cameraPoint[0] / zC) + camera.cx;
   const v = camera.fy * (cameraPoint[1] / zC) + camera.cy;
-  const pixelX = Math.round(u);
-  const pixelY = Math.round(v);
+  const pixelX = Math.floor(u);
+  const pixelY = Math.floor(v);
 
-  if (pixelX < 0 || pixelY < 0 || pixelX >= frame.width || pixelY >= frame.height) {
+  if (pixelX < 0 || pixelY < 0 || pixelX >= frame.width - 1 || pixelY >= frame.height - 1) {
     return null;
   }
 
-  const offset = (pixelY * frame.width + pixelX) * 4;
+  const tx = Math.min(Math.max(u - pixelX, 0), 1);
+  const ty = Math.min(Math.max(v - pixelY, 0), 1);
+
+  const c00 = readFrameRgb(frame, pixelX, pixelY);
+  const c10 = readFrameRgb(frame, pixelX + 1, pixelY);
+  const c01 = readFrameRgb(frame, pixelX, pixelY + 1);
+  const c11 = readFrameRgb(frame, pixelX + 1, pixelY + 1);
+
   return [
-    (frame.rgba[offset] ?? 0) / 255,
-    (frame.rgba[offset + 1] ?? 0) / 255,
-    (frame.rgba[offset + 2] ?? 0) / 255
+    bilerp(c00[0], c10[0], c01[0], c11[0], tx, ty),
+    bilerp(c00[1], c10[1], c01[1], c11[1], tx, ty),
+    bilerp(c00[2], c10[2], c01[2], c11[2], tx, ty)
   ];
 }
 
@@ -178,4 +187,19 @@ function transformPoint(m: number[], x: number, y: number, z: number): [number, 
     m[4] * x + m[5] * y + m[6] * z + m[7],
     m[8] * x + m[9] * y + m[10] * z + m[11]
   ];
+}
+
+function readFrameRgb(frame: DecodedRosImage, x: number, y: number): [number, number, number] {
+  const offset = (y * frame.width + x) * 4;
+  return [
+    (frame.rgba[offset] ?? 0) / 255,
+    (frame.rgba[offset + 1] ?? 0) / 255,
+    (frame.rgba[offset + 2] ?? 0) / 255
+  ];
+}
+
+function bilerp(c00: number, c10: number, c01: number, c11: number, tx: number, ty: number): number {
+  const top = c00 * (1 - tx) + c10 * tx;
+  const bottom = c01 * (1 - tx) + c11 * tx;
+  return top * (1 - ty) + bottom * ty;
 }

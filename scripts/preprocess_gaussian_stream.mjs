@@ -409,6 +409,7 @@ async function main() {
       id: `chunk-${index}`,
       file: fileName,
       path: targetPath,
+      bytes: spzBytes.byteLength,
       splats: count,
       center: {
         x: (bounds.minX + bounds.maxX) * 0.5,

@@ -17,6 +17,7 @@ import type { DecodedPointCloud } from "../ros/pointCloud2";
 
 export type ViewerMode = "live" | "playback" | "gs";
 export type GsControlMode = "orbit" | "fps";
+export type PresentationMode = "default" | "showcase";
 
 interface KeyboardState {
   forward: boolean;
@@ -27,6 +28,22 @@ interface KeyboardState {
   down: boolean;
   boost: boolean;
 }
+
+interface PlaybackScanTrailEntry {
+  object: THREE.Points;
+  insertedAtMs: number;
+  stampMs: number;
+}
+
+const GAUSSIAN_INITIAL_BYTE_BUDGET = {
+  balanced: 10 * 1024 * 1024,
+  quality: 16 * 1024 * 1024,
+  ultra: 20 * 1024 * 1024,
+  raw: 16 * 1024 * 1024
+} as const;
+
+const ROBOT_SMOOTHING_POSITION_ALPHA = 0.18;
+const ROBOT_SMOOTHING_ROTATION_ALPHA = 0.22;
 
 export class LiveGsViewer {
   private static readonly MAX_FPS_PITCH = THREE.MathUtils.degToRad(85);
@@ -41,9 +58,11 @@ export class LiveGsViewer {
   private readonly gaussianLayer = new THREE.Group();
   private readonly meshLayer = new THREE.Group();
   private readonly pointCloudLayer = new THREE.Group();
+  private readonly sceneGuidesLayer = new THREE.Group();
   private readonly staticPointCloudLayer = new THREE.Group();
   private readonly livePointCloudLayer = new THREE.Group();
   private readonly playbackMapPointCloudLayer = new THREE.Group();
+  private readonly playbackScanGhostLayer = new THREE.Group();
   private readonly playbackScanPointCloudLayer = new THREE.Group();
   private readonly robotLayer = new THREE.Group();
   private readonly trajectoryLayer = new THREE.Group();
@@ -63,6 +82,9 @@ export class LiveGsViewer {
   private resizeObserver: ResizeObserver | null = null;
   private mode: ViewerMode = "live";
   private gsControlMode: GsControlMode = "orbit";
+  private presentationMode: PresentationMode = "default";
+  /** When true in playback workspace, load Spark gaussian in-browser (cinema “Web GS”) instead of HiFi-only. */
+  private playbackCompareUsesWebGs = false;
   private gaussianVariant = "balanced";
   private visibility: LayerVisibility = {
     gaussian: true,
@@ -84,9 +106,15 @@ export class LiveGsViewer {
   private robotMarker: THREE.Object3D;
   private trajectoryLine: Line2 | null = null;
   private plannedPathLine: THREE.Line | null = null;
+  private latestTrajectory: Pose3D[] = [];
+  private targetRobotPosition = new THREE.Vector3();
+  private targetRobotQuaternion = new THREE.Quaternion();
+  private hasTargetRobotPose = false;
   private livePointCloudObject: THREE.Points | null = null;
   private playbackMapPointCloudObject: THREE.Points | null = null;
   private playbackScanPointCloudObject: THREE.Points | null = null;
+  private playbackScanPointCloudStampMs: number | null = null;
+  private playbackScanTrailEntries: PlaybackScanTrailEntry[] = [];
   private latestLivePointCloud: DecodedPointCloud | null = null;
   private latestPlaybackMapPointCloud: DecodedPointCloud | null = null;
   private latestPlaybackScanPointCloud: DecodedPointCloud | null = null;
@@ -100,6 +128,22 @@ export class LiveGsViewer {
   private readonly followCameraOffset = new THREE.Vector3(-6, -6, 4);
   private readonly prefetchedGaussianUrls = new Set<string>();
   private gaussianPrefetchTask: Promise<void> | null = null;
+  private trajectoryHeadLine: THREE.Line | null = null;
+  private trajectoryHeadAnchor: THREE.Vector3 | null = null;
+  private readonly sparkRenderer: (THREE.Object3D & {
+    originDistance?: number;
+    maxStdDev?: number;
+    maxPixelRadius?: number;
+    focalAdjustment?: number;
+    minAlpha?: number;
+    clipXY?: number;
+    defaultView?: {
+      sortRadial?: boolean;
+      sortDistance?: number;
+      sort32?: boolean;
+      stochastic?: boolean;
+    };
+  }) | null = null;
   private fpsYaw = 0;
   private fpsPitch = 0;
   private pointerLocked = false;
@@ -123,6 +167,64 @@ export class LiveGsViewer {
 
     this.scene.background = new THREE.Color("#111318");
     this.scene.fog = new THREE.Fog("#111318", 30, 140);
+
+    const SparkRendererCtor = (Spark as Record<string, unknown>).SparkRenderer as
+      | (new (options: {
+          renderer: THREE.WebGLRenderer;
+          originDistance?: number;
+          maxStdDev?: number;
+          maxPixelRadius?: number;
+          focalAdjustment?: number;
+          premultipliedAlpha?: boolean;
+          minAlpha?: number;
+          clipXY?: number;
+          view?: {
+            sortRadial?: boolean;
+            sortDistance?: number;
+            sort32?: boolean;
+            stochastic?: boolean;
+          };
+        }) => THREE.Object3D)
+      | undefined;
+    if (SparkRendererCtor) {
+      const sparkRenderer = new SparkRendererCtor({
+        renderer: this.renderer,
+        premultipliedAlpha: true,
+        originDistance: 0.85,
+        maxStdDev: Math.sqrt(5.9),
+        maxPixelRadius: 132,
+        focalAdjustment: 1.22,
+        minAlpha: 0.005,
+        clipXY: 1.12,
+        view: {
+          sortRadial: false,
+          sortDistance: 0.004,
+          sort32: true,
+          stochastic: false
+        }
+      }) as THREE.Object3D & {
+        originDistance?: number;
+        maxStdDev?: number;
+        maxPixelRadius?: number;
+        focalAdjustment?: number;
+        minAlpha?: number;
+        clipXY?: number;
+        defaultView?: {
+          sortRadial?: boolean;
+          sortDistance?: number;
+          sort32?: boolean;
+          stochastic?: boolean;
+        };
+      };
+      if (sparkRenderer.defaultView) {
+        sparkRenderer.defaultView.sortRadial = false;
+        sparkRenderer.defaultView.sortDistance = 0.004;
+        sparkRenderer.defaultView.sort32 = true;
+        sparkRenderer.defaultView.stochastic = false;
+      }
+      this.sparkRenderer = sparkRenderer;
+      this.scene.add(sparkRenderer);
+    }
 
     this.camera.position.set(-8, -10, 7);
     this.camera.up.set(0, 0, 1);
@@ -159,11 +261,11 @@ export class LiveGsViewer {
     const gridMaterial = grid.material as THREE.Material;
     gridMaterial.transparent = true;
     gridMaterial.opacity = 0.6;
-    this.scene.add(grid);
+    this.sceneGuidesLayer.add(grid);
 
     const axes = new THREE.AxesHelper(3);
     axes.position.set(0, 0, 0.02);
-    this.scene.add(axes);
+    this.sceneGuidesLayer.add(axes);
 
     this.robotMarker = createRobotMarker();
     this.robotLayer.add(this.robotMarker);
@@ -171,17 +273,20 @@ export class LiveGsViewer {
     this.pointCloudLayer.add(this.staticPointCloudLayer);
     this.pointCloudLayer.add(this.livePointCloudLayer);
     this.pointCloudLayer.add(this.playbackMapPointCloudLayer);
+    this.pointCloudLayer.add(this.playbackScanGhostLayer);
     this.pointCloudLayer.add(this.playbackScanPointCloudLayer);
 
     this.scene.add(this.gaussianLayer);
     this.scene.add(this.meshLayer);
     this.scene.add(this.pointCloudLayer);
+    this.scene.add(this.sceneGuidesLayer);
     this.scene.add(this.trajectoryLayer);
     this.scene.add(this.trajectoryPoseMarkerLayer);
     this.scene.add(this.plannedPathLayer);
     this.scene.add(this.robotLayer);
 
     this.setMode("live");
+    this.applyPresentationMode();
     this.installResizeObserver();
     this.applyRenderProfile();
     this.renderLoop();
@@ -190,6 +295,7 @@ export class LiveGsViewer {
   setMode(mode: ViewerMode): void {
     this.mode = mode;
     this.orbitControls.enabled = mode !== "gs" || this.gsControlMode === "orbit";
+    this.applyPresentationMode();
 
     if (mode === "gs") {
       if (this.gsControlMode === "fps") {
@@ -199,7 +305,9 @@ export class LiveGsViewer {
       }
     } else if (mode === "playback") {
       this.unlockPointerLook();
-      this.framePlaybackScene();
+      if (!this.isPlaybackCompareWebGsActive()) {
+        this.framePlaybackScene();
+      }
     } else {
       this.unlockPointerLook();
       this.frameLiveScene();
@@ -229,6 +337,39 @@ export class LiveGsViewer {
     this.applyRenderProfile();
   }
 
+  setPresentationMode(mode: PresentationMode): void {
+    this.presentationMode = mode;
+    this.applyPresentationMode();
+    this.refreshDynamicPointClouds();
+    if (this.latestTrajectory.length > 0) {
+      this.updateTrajectory(this.latestTrajectory);
+    }
+    this.applyRenderProfile();
+    if (this.mode === "playback" && !this.isPlaybackCompareWebGsActive()) {
+      this.framePlaybackScene();
+    }
+    void this.ensureDeferredAssets();
+  }
+
+  setPlaybackCompareUsesWebGs(enabled: boolean): void {
+    if (this.playbackCompareUsesWebGs === enabled) {
+      return;
+    }
+    this.playbackCompareUsesWebGs = enabled;
+    if (this.mode === "playback" && !this.shouldLoadGaussian()) {
+      this.gaussianLoadGeneration += 1;
+      this.gaussianLoadingKey = null;
+      this.clearGroup(this.gaussianLayer);
+      this.gaussianSourceKey = null;
+      this.gaussianBounds = null;
+    }
+    void this.ensureDeferredAssets();
+    this.applyRenderProfile();
+    if (this.mode === "playback" && !enabled) {
+      this.framePlaybackScene();
+    }
+  }
+
   setGaussianVariant(variant: string | null): void {
     this.gaussianVariant = variant ?? "balanced";
     this.applyRenderProfile();
@@ -243,6 +384,7 @@ export class LiveGsViewer {
     this.staticPointCloudLayer.visible = visibility.occupancyCloud && !playbackMode;
     this.livePointCloudLayer.visible = visibility.liveCloud && !playbackMode;
     this.playbackMapPointCloudLayer.visible = visibility.occupancyCloud && playbackMode;
+    this.playbackScanGhostLayer.visible = visibility.liveCloud && playbackMode;
     this.playbackScanPointCloudLayer.visible = visibility.liveCloud && playbackMode;
     if (visibility.liveCloud && !playbackMode && this.latestLivePointCloud) {
       this.renderLivePointCloud(this.latestLivePointCloud);
@@ -252,6 +394,8 @@ export class LiveGsViewer {
     }
     if (visibility.liveCloud && playbackMode && this.latestPlaybackScanPointCloud) {
       this.renderPlaybackScanPointCloud(this.latestPlaybackScanPointCloud);
+    } else if (!visibility.liveCloud && playbackMode) {
+      this.clearPlaybackScanTrail();
     }
     this.robotLayer.visible = visibility.robot;
     this.trajectoryLayer.visible = visibility.trajectory;
@@ -310,17 +454,23 @@ export class LiveGsViewer {
       return;
     }
 
-    this.robotLayer.position.set(pose.position.x, pose.position.y, pose.position.z);
-    this.robotMarker.quaternion.set(
+    this.targetRobotPosition.set(pose.position.x, pose.position.y, pose.position.z);
+    this.targetRobotQuaternion.set(
       pose.orientation.x,
       pose.orientation.y,
       pose.orientation.z,
       pose.orientation.w
     );
+    if (!this.hasTargetRobotPose) {
+      this.robotLayer.position.copy(this.targetRobotPosition);
+      this.robotMarker.quaternion.copy(this.targetRobotQuaternion);
+      this.hasTargetRobotPose = true;
+    }
     this.syncFollowCamera();
   }
 
   updateTrajectory(path: Pose3D[]): void {
+    this.latestTrajectory = path;
     if (this.trajectoryLine) {
       this.trajectoryLayer.remove(this.trajectoryLine);
       this.trajectoryLine.geometry.dispose();
@@ -328,22 +478,40 @@ export class LiveGsViewer {
       this.trajectoryLine = null;
     }
     this.clearGroup(this.trajectoryPoseMarkerLayer);
+    this.trajectoryHeadAnchor = null;
 
-    if (path.length < 2) {
+    if (path.length < 1) {
+      this.updateTrajectoryHead();
       return;
     }
 
-    const positions = new Array<number>(path.length * 3);
-    const colors = new Array<number>(path.length * 3);
+    const lastPose = path[path.length - 1];
+    this.trajectoryHeadAnchor = new THREE.Vector3(
+      lastPose.position.x,
+      lastPose.position.y,
+      lastPose.position.z + 0.07
+    );
 
-    for (let index = 0; index < path.length; index += 1) {
-      const pose = path[index];
+    if (path.length < 2) {
+      this.updateTrajectoryHead();
+      return;
+    }
+
+    const sampledPath = smoothTrajectoryPath(
+      path,
+      this.presentationMode === "showcase" && this.mode === "playback" ? 6 : 4
+    );
+    const positions = new Array<number>(sampledPath.length * 3);
+    const colors = new Array<number>(sampledPath.length * 3);
+
+    for (let index = 0; index < sampledPath.length; index += 1) {
+      const pose = sampledPath[index];
       const offset = index * 3;
       positions[offset] = pose.position.x;
       positions[offset + 1] = pose.position.y;
       positions[offset + 2] = pose.position.z + 0.07;
 
-      const t = path.length <= 1 ? 0 : index / (path.length - 1);
+      const t = sampledPath.length <= 1 ? 0 : index / (sampledPath.length - 1);
       const color = new THREE.Color().setHSL((1 - t) * 0.74, 0.88, 0.58);
       colors[offset] = color.r;
       colors[offset + 1] = color.g;
@@ -358,33 +526,41 @@ export class LiveGsViewer {
     const material = new LineMaterial({
       color: "#ffffff",
       vertexColors: true,
-      linewidth: 6,
+      linewidth: this.presentationMode === "showcase" && this.mode === "playback" ? 14 : 8,
       transparent: true,
-      opacity: 0.92,
+      opacity: this.presentationMode === "showcase" && this.mode === "playback" ? 0.98 : 0.92,
       depthWrite: false,
+      depthTest: false,
       dashed: false
     });
     material.resolution.set(resolution.x, resolution.y);
 
     this.trajectoryLine = new Line2(geometry, material);
     this.trajectoryLine.computeLineDistances();
+    this.trajectoryLine.renderOrder = 28;
     this.trajectoryLayer.add(this.trajectoryLine);
 
-    const markerStride = Math.max(1, Math.floor(path.length / 28));
+    const markerStride = Math.max(1, Math.floor(path.length / (this.presentationMode === "showcase" ? 64 : 28)));
     for (let index = 0; index < path.length; index += markerStride) {
       const pose = path[index];
       const t = path.length <= 1 ? 0 : index / (path.length - 1);
       const color = new THREE.Color().setHSL((1 - t) * 0.74, 0.88, 0.58);
-      const marker = createTrajectoryPoseMarker(color);
-      marker.position.set(pose.position.x, pose.position.y, pose.position.z + 0.06);
+      const marker = createTrajectoryPoseMarker(
+        color,
+        this.presentationMode === "showcase" && this.mode === "playback" ? 1.55 : 1
+      );
+      marker.position.set(pose.position.x, pose.position.y, pose.position.z + 0.075);
       marker.quaternion.set(
         pose.orientation.x,
         pose.orientation.y,
         pose.orientation.z,
         pose.orientation.w
       );
+      marker.renderOrder = 29;
       this.trajectoryPoseMarkerLayer.add(marker);
     }
+
+    this.updateTrajectoryHead();
   }
 
   updatePlannedPath(path: PlanPoint2D[]): void {
@@ -457,7 +633,35 @@ export class LiveGsViewer {
     if (this.mode !== "playback" || !this.visibility.liveCloud) {
       return;
     }
+    const showcasePlayback = this.presentationMode === "showcase" && this.mode === "playback";
+    const currentStampMs = cloud.stampMs ?? 0;
+    let previousSnapshot: THREE.Points | null = null;
+    if (
+      showcasePlayback &&
+      this.playbackScanPointCloudObject &&
+      this.playbackScanPointCloudStampMs !== null &&
+      this.playbackScanPointCloudStampMs !== currentStampMs
+    ) {
+      previousSnapshot = clonePointCloudSnapshot(this.playbackScanPointCloudObject);
+    }
     this.renderPlaybackScanPointCloud(cloud);
+    if (showcasePlayback && previousSnapshot && this.playbackScanPointCloudStampMs !== null) {
+      const material = previousSnapshot.material as THREE.PointsMaterial;
+      material.transparent = true;
+      material.opacity = 0.34;
+      material.depthWrite = false;
+      material.depthTest = false;
+      material.needsUpdate = true;
+      previousSnapshot.renderOrder = 24;
+      this.playbackScanGhostLayer.add(previousSnapshot);
+      this.playbackScanTrailEntries.push({
+        object: previousSnapshot,
+        insertedAtMs: performance.now(),
+        stampMs: this.playbackScanPointCloudStampMs
+      });
+    }
+    this.playbackScanPointCloudStampMs = currentStampMs;
+    this.updatePlaybackScanTrail();
   }
 
   private renderLivePointCloud(cloud: DecodedPointCloud): void {
@@ -488,7 +692,17 @@ export class LiveGsViewer {
   }
 
   private renderPlaybackMapPointCloud(cloud: DecodedPointCloud): void {
-    const renderCloud = samplePointCloudForRender(cloud, this.interactionRenderActive ? 45_000 : 120_000);
+    const showcasePlayback = this.presentationMode === "showcase" && this.mode === "playback";
+    const renderPointBudget = showcasePlayback
+      ? this.interactionRenderActive
+        ? 180_000
+        : 520_000
+      : this.interactionRenderActive
+        ? 32_000
+        : 72_000;
+    const renderCloud = showcasePlayback
+      ? samplePointCloudPrioritizingColor(cloud, renderPointBudget)
+      : samplePointCloudForRender(cloud, renderPointBudget);
     const hadBounds = Boolean(this.playbackMapPointCloudBounds);
     const nextBounds = computePointCloudBounds(renderCloud.positions);
     this.playbackMapPointCloudObject = this.renderPointCloudObject(
@@ -497,38 +711,58 @@ export class LiveGsViewer {
       renderCloud,
       {
         defaultColor: "#d8ecff",
-        sizeNear: 0.02,
-        sizeFar: 0.012,
-        opacity: 0.98,
+        sizeNear: showcasePlayback ? 0.017 : 0.02,
+        sizeFar: showcasePlayback ? 0.0095 : 0.012,
+        opacity: showcasePlayback ? 0.95 : 0.98,
         transparent: false,
         depthWrite: true,
+        depthTest: true,
         alphaTest: 0.42,
         crispSprite: true,
-        bounds: nextBounds
+        bounds: nextBounds,
+        renderOrder: 8
       }
     );
     this.playbackMapPointCloudBounds = nextBounds;
-    if (this.mode === "playback" && !this.followRobot && !hadBounds && this.playbackMapPointCloudBounds) {
+    if (
+      this.mode === "playback" &&
+      !this.followRobot &&
+      !this.isPlaybackCompareWebGsActive() &&
+      !hadBounds &&
+      this.playbackMapPointCloudBounds
+    ) {
       this.framePlaybackScene();
     }
   }
 
   private renderPlaybackScanPointCloud(cloud: DecodedPointCloud): void {
-    const renderCloud = samplePointCloudForRender(cloud, this.interactionRenderActive ? 6_000 : 16_000);
+    const showcasePlayback = this.presentationMode === "showcase" && this.mode === "playback";
+    const renderCloud = samplePointCloudForRender(
+      cloud,
+      showcasePlayback
+        ? this.interactionRenderActive
+          ? 32_000
+          : 96_000
+        : this.interactionRenderActive
+          ? 4_000
+          : 10_000
+    );
     this.playbackScanPointCloudObject = this.renderPointCloudObject(
       this.playbackScanPointCloudObject,
       this.playbackScanPointCloudLayer,
       renderCloud,
       {
         defaultColor: "#ffd38c",
-        sizeNear: 0.028,
-        sizeFar: 0.018,
-        opacity: 0.84,
-        transparent: false,
-        depthWrite: true,
+        sizeNear: showcasePlayback ? 0.022 : 0.028,
+        sizeFar: showcasePlayback ? 0.013 : 0.018,
+        opacity: showcasePlayback ? 0.995 : 0.84,
+        transparent: showcasePlayback,
+        depthWrite: !showcasePlayback,
+        depthTest: !showcasePlayback,
         alphaTest: 0.48,
         crispSprite: true,
-        bounds: this.playbackMapPointCloudBounds
+        bounds: this.playbackMapPointCloudBounds,
+        renderOrder: showcasePlayback ? 32 : 12
       }
     );
   }
@@ -544,9 +778,11 @@ export class LiveGsViewer {
       opacity: number;
       transparent?: boolean;
       depthWrite?: boolean;
+      depthTest?: boolean;
       alphaTest?: number;
       crispSprite?: boolean;
       bounds?: THREE.Box3 | null;
+      renderOrder?: number;
     }
   ): THREE.Points {
     const useVertexColors = Boolean(cloud.colors && cloud.colors.length === cloud.positions.length);
@@ -563,7 +799,8 @@ export class LiveGsViewer {
         alphaMap: options.crispSprite ? this.pointSpriteTexture : null,
         alphaTest: options.alphaTest ?? 0,
         fog: false,
-        depthWrite: options.depthWrite ?? false
+        depthWrite: options.depthWrite ?? false,
+        depthTest: options.depthTest ?? true
       });
       object = new THREE.Points(geometry, material);
       object.frustumCulled = false;
@@ -591,7 +828,9 @@ export class LiveGsViewer {
     material.opacity = options.opacity;
     material.transparent = options.transparent ?? true;
     material.depthWrite = options.depthWrite ?? false;
+    material.depthTest = options.depthTest ?? true;
     material.alphaTest = options.alphaTest ?? 0;
+    object.renderOrder = options.renderOrder ?? 0;
     material.map = options.crispSprite ? this.pointSpriteTexture : null;
     material.alphaMap = options.crispSprite ? this.pointSpriteTexture : null;
     material.size =
@@ -623,6 +862,38 @@ export class LiveGsViewer {
       },
       stampMs: Date.now()
     };
+  }
+
+  isInteractionActive(): boolean {
+    return this.interactionRenderActive || this.pointerLocked;
+  }
+
+  setCameraPose(pose: Pose3D, target?: { x: number; y: number; z: number }): void {
+    this.camera.position.set(
+      pose.position.x,
+      pose.position.y,
+      pose.position.z
+    );
+    this.camera.quaternion.set(
+      pose.orientation.x,
+      pose.orientation.y,
+      pose.orientation.z,
+      pose.orientation.w
+    );
+
+    if (target) {
+      this.orbitControls.target.set(target.x, target.y, target.z);
+    }
+
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
+    this.fpsYaw = Math.atan2(forward.y, forward.x);
+    this.fpsPitch = THREE.MathUtils.clamp(
+      Math.asin(THREE.MathUtils.clamp(forward.z, -1, 1)),
+      -LiveGsViewer.MAX_FPS_PITCH,
+      LiveGsViewer.MAX_FPS_PITCH
+    );
+    this.camera.up.set(0, 0, 1);
+    this.orbitControls.update();
   }
 
   dispose(): void {
@@ -695,7 +966,11 @@ export class LiveGsViewer {
     this.gaussianLayer.add(object);
     this.gaussianBounds = bounds;
     if (bounds && isFiniteBox(bounds)) {
-      this.fitCameraToBox(bounds, 1.2);
+      if (this.mode === "playback" && !this.isPlaybackCompareWebGsActive()) {
+        this.framePlaybackScene();
+      } else if (this.mode !== "playback") {
+        this.fitCameraToBox(bounds, 1.2);
+      }
     }
     this.gaussianSourceKey = sourceKey;
   }
@@ -711,34 +986,52 @@ export class LiveGsViewer {
 
     if (combinedBounds && isFiniteBox(combinedBounds)) {
       this.gaussianBounds = combinedBounds;
-      this.fitCameraToBox(combinedBounds, 1.05);
+      if (this.mode === "playback" && !this.isPlaybackCompareWebGsActive()) {
+        this.framePlaybackScene();
+      } else if (this.mode !== "playback") {
+        this.fitCameraToBox(combinedBounds, 1.05);
+      }
     }
 
-    const initialBatch = orderedChunks.slice(0, 6);
-    const deferredBatch = orderedChunks.slice(6);
+    const [initialBatch, deferredBatch] = splitGaussianChunksByBudget(
+      orderedChunks,
+      this.gaussianVariant
+    );
 
-    for (const chunk of initialBatch) {
-      if (generation !== this.gaussianLoadGeneration) {
-        return;
-      }
-
-      const { object, bounds } = await this.createGaussianObject(chunk.url);
-      if (generation !== this.gaussianLoadGeneration) {
-        disposeObject(object);
-        return;
-      }
-
-      this.gaussianLayer.add(object);
-
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-    }
+    await this.loadGaussianChunkBatch(initialBatch, generation, 2);
 
     window.setTimeout(async () => {
-      for (const chunk of deferredBatch) {
-        if (generation !== this.gaussianLoadGeneration) {
+      await this.loadGaussianChunkBatch(deferredBatch, generation, 3);
+      if (generation === this.gaussianLoadGeneration) {
+        this.gaussianBounds = combinedBounds;
+        this.gaussianSourceKey = sourceKey;
+      }
+    }, 0);
+
+    this.gaussianBounds = combinedBounds;
+    this.gaussianSourceKey = sourceKey;
+  }
+
+  private async loadGaussianChunkBatch(
+    chunks: GaussianChunk[],
+    generation: number,
+    concurrency: number
+  ): Promise<void> {
+    if (!chunks.length) {
+      return;
+    }
+
+    let nextIndex = 0;
+    const workerCount = Math.min(Math.max(concurrency, 1), chunks.length);
+    const workers = new Array(workerCount).fill(0).map(async () => {
+      while (true) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        if (currentIndex >= chunks.length || generation !== this.gaussianLoadGeneration) {
           return;
         }
 
+        const chunk = chunks[currentIndex];
         const { object } = await this.createGaussianObject(chunk.url);
         if (generation !== this.gaussianLoadGeneration) {
           disposeObject(object);
@@ -748,15 +1041,9 @@ export class LiveGsViewer {
         this.gaussianLayer.add(object);
         await new Promise((resolve) => window.setTimeout(resolve, 0));
       }
+    });
 
-      if (generation === this.gaussianLoadGeneration) {
-        this.gaussianBounds = combinedBounds;
-        this.gaussianSourceKey = sourceKey;
-      }
-    }, 0);
-
-    this.gaussianBounds = combinedBounds;
-    this.gaussianSourceKey = sourceKey;
+    await Promise.all(workers);
   }
 
   private async loadMesh(url: string): Promise<void> {
@@ -857,12 +1144,21 @@ export class LiveGsViewer {
     this.animationHandle = requestAnimationFrame(this.renderLoop);
     this.syncInteractionRenderState();
 
-    if (this.mode === "live" || this.gsControlMode === "orbit") {
+    const orbitStyleCamera =
+      this.mode === "live" ||
+      this.mode === "playback" ||
+      (this.mode === "gs" && this.gsControlMode === "orbit");
+
+    if (orbitStyleCamera) {
       this.orbitControls.update();
+      this.updateRobotSmoothing();
+      this.updateTrajectoryHead();
+      this.updatePlaybackScanTrail();
       this.syncFollowCamera();
     } else {
       this.updateFps(delta);
       this.clampFpsOrientation();
+      this.updatePlaybackScanTrail();
     }
 
     this.updateLivePointCloudReveal(delta);
@@ -892,6 +1188,90 @@ export class LiveGsViewer {
       0,
       this.livePointCloudRevealCount
     );
+  }
+
+  private updateRobotSmoothing(): void {
+    if (!this.hasTargetRobotPose) {
+      return;
+    }
+
+    this.robotLayer.position.lerp(this.targetRobotPosition, ROBOT_SMOOTHING_POSITION_ALPHA);
+    this.robotMarker.quaternion.slerp(this.targetRobotQuaternion, ROBOT_SMOOTHING_ROTATION_ALPHA);
+  }
+
+  private updateTrajectoryHead(): void {
+    if (!this.trajectoryHeadAnchor || !this.hasTargetRobotPose || !this.visibility.trajectory) {
+      if (this.trajectoryHeadLine) {
+        this.trajectoryHeadLine.visible = false;
+      }
+      return;
+    }
+
+    const headPosition = this.robotLayer.position.clone();
+    headPosition.z += 0.07;
+    if (headPosition.distanceToSquared(this.trajectoryHeadAnchor) <= 1e-6) {
+      if (this.trajectoryHeadLine) {
+        this.trajectoryHeadLine.visible = false;
+      }
+      return;
+    }
+
+    if (!this.trajectoryHeadLine) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(new Float32Array(6), 3));
+      const material = new THREE.LineBasicMaterial({
+        color: "#ff8d72",
+        transparent: true,
+        opacity: 0.92,
+        depthWrite: false,
+        depthTest: false
+      });
+      this.trajectoryHeadLine = new THREE.Line(geometry, material);
+      this.trajectoryHeadLine.renderOrder = 30;
+      this.trajectoryLayer.add(this.trajectoryHeadLine);
+    }
+
+    const geometry = this.trajectoryHeadLine.geometry as THREE.BufferGeometry;
+    const position = geometry.getAttribute("position") as THREE.BufferAttribute;
+    position.setXYZ(0, this.trajectoryHeadAnchor.x, this.trajectoryHeadAnchor.y, this.trajectoryHeadAnchor.z);
+    position.setXYZ(1, headPosition.x, headPosition.y, headPosition.z);
+    position.needsUpdate = true;
+    geometry.computeBoundingSphere();
+    this.trajectoryHeadLine.visible = true;
+  }
+
+  private updatePlaybackScanTrail(): void {
+    if (!this.playbackScanTrailEntries.length) {
+      return;
+    }
+
+    if (this.mode !== "playback" || this.presentationMode !== "showcase" || !this.visibility.liveCloud) {
+      this.clearPlaybackScanTrail();
+      return;
+    }
+
+    const now = performance.now();
+    const lifetimeMs = 700;
+    const maxTrailEntries = 5;
+    const survivors: PlaybackScanTrailEntry[] = [];
+    for (let index = 0; index < this.playbackScanTrailEntries.length; index += 1) {
+      const entry = this.playbackScanTrailEntries[index];
+      const ageMs = now - entry.insertedAtMs;
+      const expired = ageMs >= lifetimeMs;
+      const overBudget = this.playbackScanTrailEntries.length - index > maxTrailEntries;
+      if (expired || overBudget) {
+        this.playbackScanGhostLayer.remove(entry.object);
+        entry.object.geometry.dispose();
+        (entry.object.material as THREE.Material).dispose();
+        continue;
+      }
+      const progress = THREE.MathUtils.clamp(ageMs / lifetimeMs, 0, 1);
+      const material = entry.object.material as THREE.PointsMaterial;
+      material.opacity = (1 - progress) * 0.34;
+      material.needsUpdate = true;
+      survivors.push(entry);
+    }
+    this.playbackScanTrailEntries = survivors;
   }
 
   private updateFps(delta: number): void {
@@ -1054,12 +1434,36 @@ export class LiveGsViewer {
       return;
     }
 
+    if (this.isPlaybackCompareWebGsActive()) {
+      return;
+    }
+
     if (this.followRobot) {
       this.syncFollowCamera(true);
       return;
     }
 
-    const preferredBounds = this.playbackMapPointCloudBounds ?? this.getPreferredLiveBounds();
+    const mapBox = this.playbackMapPointCloudBounds;
+    const gaussianBox = this.visibility.gaussian ? this.gaussianBounds : null;
+    const meshBox = this.visibility.sdfMesh ? this.meshBounds : null;
+    let preferredBounds: THREE.Box3 | null = null;
+
+    if (mapBox && isFiniteBox(mapBox)) {
+      preferredBounds = mapBox.clone();
+      if (gaussianBox && isFiniteBox(gaussianBox)) {
+        preferredBounds.union(gaussianBox);
+      }
+      if (meshBox && isFiniteBox(meshBox)) {
+        preferredBounds.union(meshBox);
+      }
+    } else if (gaussianBox && isFiniteBox(gaussianBox)) {
+      preferredBounds = gaussianBox.clone();
+    } else if (meshBox && isFiniteBox(meshBox)) {
+      preferredBounds = meshBox.clone();
+    } else {
+      preferredBounds = this.getPreferredLiveBounds();
+    }
+
     if (preferredBounds && isFiniteBox(preferredBounds)) {
       this.fitCameraToBox(preferredBounds, 1.1);
       return;
@@ -1094,9 +1498,12 @@ export class LiveGsViewer {
   }
 
   private getPreferredLiveBounds(): THREE.Box3 | null {
-    const bounds = [this.livePointCloudBounds, this.meshBounds, this.rawPointCloudBounds, this.gaussianBounds].filter(
-      (box): box is THREE.Box3 => Boolean(box && isFiniteBox(box))
-    );
+    const bounds = [
+      this.visibility.liveCloud ? this.livePointCloudBounds : null,
+      this.visibility.sdfMesh ? this.meshBounds : null,
+      this.visibility.occupancyCloud ? this.rawPointCloudBounds : null,
+      this.visibility.gaussian ? this.gaussianBounds : null
+    ].filter((box): box is THREE.Box3 => Boolean(box && isFiniteBox(box)));
 
     if (!bounds.length) {
       return null;
@@ -1139,7 +1546,12 @@ export class LiveGsViewer {
 
     const target = this.robotLayer.position.clone();
     target.z += 0.9;
-    const desiredPosition = target.clone().add(this.followCameraOffset);
+    let desiredPosition = target.clone().add(this.followCameraOffset);
+    if (this.presentationMode === "showcase" && this.mode === "playback") {
+      const localOffset = new THREE.Vector3(-4.6, -1.2, 2.45);
+      const rotatedOffset = localOffset.applyQuaternion(this.robotMarker.quaternion.clone());
+      desiredPosition = target.clone().add(rotatedOffset);
+    }
 
     if (force) {
       this.camera.position.copy(desiredPosition);
@@ -1153,7 +1565,7 @@ export class LiveGsViewer {
   }
 
   private applyRenderProfile(): void {
-    const gaussianActive = this.mode === "gs" && this.visibility.gaussian;
+    const gaussianActive = this.visibility.gaussian && this.shouldLoadGaussian();
     const heavyLiveCloud =
       (
         (this.mode === "playback"
@@ -1175,6 +1587,7 @@ export class LiveGsViewer {
         ? 0.8
         : 1.0;
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, maxPixelRatio));
+    this.applySparkRenderTuning(gaussianActive);
 
     const parent = this.canvas.parentElement;
     if (!parent) {
@@ -1184,6 +1597,14 @@ export class LiveGsViewer {
     const height = Math.max(parent.clientHeight, 1);
     this.renderer.setSize(width, height, false);
     this.updateLineMaterialResolution(width, height);
+  }
+
+  private applyPresentationMode(): void {
+    const showcasePlayback = this.presentationMode === "showcase" && this.mode === "playback";
+    const background = showcasePlayback ? "#f7f5ef" : "#111318";
+    this.scene.background = new THREE.Color(background);
+    this.scene.fog = new THREE.Fog(background, showcasePlayback ? 58 : 30, showcasePlayback ? 260 : 140);
+    this.sceneGuidesLayer.visible = !showcasePlayback && this.mode !== "gs";
   }
 
   private installResizeObserver(): void {
@@ -1286,19 +1707,46 @@ export class LiveGsViewer {
       return;
     }
 
-    if (kind === "playbackScan" && this.playbackScanPointCloudObject) {
-      this.playbackScanPointCloudLayer.remove(this.playbackScanPointCloudObject);
-      this.playbackScanPointCloudObject.geometry.dispose();
-      (this.playbackScanPointCloudObject.material as THREE.Material).dispose();
-      this.playbackScanPointCloudObject = null;
+    if (kind === "playbackScan") {
+      if (this.playbackScanPointCloudObject) {
+        this.playbackScanPointCloudLayer.remove(this.playbackScanPointCloudObject);
+        this.playbackScanPointCloudObject.geometry.dispose();
+        (this.playbackScanPointCloudObject.material as THREE.Material).dispose();
+        this.playbackScanPointCloudObject = null;
+      }
+      this.playbackScanPointCloudStampMs = null;
+      this.clearPlaybackScanTrail();
     }
+  }
+
+  private clearPlaybackScanTrail(): void {
+    for (const entry of this.playbackScanTrailEntries) {
+      this.playbackScanGhostLayer.remove(entry.object);
+      entry.object.geometry.dispose();
+      (entry.object.material as THREE.Material).dispose();
+    }
+    this.playbackScanTrailEntries = [];
   }
 
   private shouldLoadGaussian(): boolean {
     const gaussian = this.manifest?.gaussian;
-    return this.mode === "gs" &&
-      this.visibility.gaussian &&
-      Boolean(gaussian?.url || gaussian?.chunks?.length);
+    if (!this.visibility.gaussian || !(gaussian?.url || gaussian?.chunks?.length)) {
+      return false;
+    }
+    if (this.mode === "gs") {
+      return true;
+    }
+    if (this.mode !== "playback") {
+      return false;
+    }
+    if (this.presentationMode === "showcase") {
+      return true;
+    }
+    return this.playbackCompareUsesWebGs;
+  }
+
+  private isPlaybackCompareWebGsActive(): boolean {
+    return this.mode === "playback" && this.playbackCompareUsesWebGs;
   }
 
   private async ensureDeferredAssets(): Promise<void> {
@@ -1363,87 +1811,197 @@ export class LiveGsViewer {
           ? [gaussian.url]
           : [];
 
-    const pending = urls.filter((url) => !this.prefetchedGaussianUrls.has(url)).slice(0, 10);
+    const pending = urls.filter((url) => !this.prefetchedGaussianUrls.has(url)).slice(0, 16);
     if (!pending.length) {
       return;
     }
 
     this.gaussianPrefetchTask = (async () => {
-      for (const url of pending) {
-        try {
-          await fetch(url, { cache: "force-cache" });
-          this.prefetchedGaussianUrls.add(url);
-        } catch (error) {
-          console.warn("Failed to prefetch gaussian asset.", url, error);
-          break;
-        }
-      }
+      let nextIndex = 0;
+      const workerCount = Math.min(4, pending.length);
+      await Promise.all(
+        new Array(workerCount).fill(0).map(async () => {
+          while (true) {
+            const currentIndex = nextIndex;
+            nextIndex += 1;
+            if (currentIndex >= pending.length) {
+              return;
+            }
+            const url = pending[currentIndex];
+            try {
+              await fetch(url, { cache: "force-cache" });
+              this.prefetchedGaussianUrls.add(url);
+            } catch (error) {
+              console.warn("Failed to prefetch gaussian asset.", url, error);
+              return;
+            }
+          }
+        })
+      );
     })().finally(() => {
       this.gaussianPrefetchTask = null;
     });
   }
+
+  private applySparkRenderTuning(gaussianActive: boolean): void {
+    if (!this.sparkRenderer) {
+      return;
+    }
+
+    if (!gaussianActive) {
+      this.sparkRenderer.originDistance = 1.1;
+      this.sparkRenderer.maxStdDev = Math.sqrt(5.6);
+      this.sparkRenderer.maxPixelRadius = 120;
+      this.sparkRenderer.focalAdjustment = 1.05;
+      this.sparkRenderer.minAlpha = 0.006;
+      this.sparkRenderer.clipXY = 1.1;
+      return;
+    }
+
+    const interacting = this.interactionRenderActive || this.gsControlMode === "fps";
+    switch (this.gaussianVariant) {
+      case "ultra":
+        this.sparkRenderer.originDistance = interacting ? 1.3 : 1.0;
+        this.sparkRenderer.maxStdDev = interacting ? Math.sqrt(5.4) : Math.sqrt(5.95);
+        this.sparkRenderer.maxPixelRadius = interacting ? 104 : 132;
+        this.sparkRenderer.focalAdjustment = 1.24;
+        this.sparkRenderer.minAlpha = interacting ? 0.008 : 0.0065;
+        this.sparkRenderer.clipXY = 1.08;
+        break;
+      case "quality":
+        this.sparkRenderer.originDistance = interacting ? 1.15 : 0.92;
+        this.sparkRenderer.maxStdDev = interacting ? Math.sqrt(5.25) : Math.sqrt(5.7);
+        this.sparkRenderer.maxPixelRadius = interacting ? 96 : 122;
+        this.sparkRenderer.focalAdjustment = 1.2;
+        this.sparkRenderer.minAlpha = interacting ? 0.0085 : 0.007;
+        this.sparkRenderer.clipXY = 1.08;
+        break;
+      default:
+        this.sparkRenderer.originDistance = interacting ? 1.2 : 1.0;
+        this.sparkRenderer.maxStdDev = interacting ? Math.sqrt(5.1) : Math.sqrt(5.45);
+        this.sparkRenderer.maxPixelRadius = interacting ? 90 : 112;
+        this.sparkRenderer.focalAdjustment = 1.16;
+        this.sparkRenderer.minAlpha = interacting ? 0.009 : 0.0075;
+        this.sparkRenderer.clipXY = 1.08;
+        break;
+    }
+  }
 }
 
 function createRobotMarker(): THREE.Object3D {
+  return createFrustumMarker(new THREE.Color("#4bd0ff"), 0.8, 0.95);
+}
+
+function createTrajectoryPoseMarker(color: THREE.Color, scale = 1): THREE.Object3D {
+  return createFrustumMarker(color, 0.42 * scale, 0.8);
+}
+
+function createWireBox(width: number, depth: number, height: number, color: THREE.Color, opacity: number): THREE.Object3D {
+  const edges = new THREE.EdgesGeometry(new THREE.BoxGeometry(width, depth, height));
+  return new THREE.LineSegments(
+    edges,
+    new THREE.LineBasicMaterial({
+      color,
+      transparent: true,
+      opacity,
+      depthWrite: false
+    })
+  );
+}
+
+function createSolidBoxMarker(
+  width: number,
+  depth: number,
+  height: number,
+  fillColor: THREE.Color,
+  fillOpacity: number,
+  outlineColor: THREE.Color,
+  outlineOpacity: number
+): THREE.Object3D {
   const group = new THREE.Group();
-
-  const body = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.22, 0.22, 0.18, 24),
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(width, depth, height),
     new THREE.MeshStandardMaterial({
-      color: "#ff784f",
-      metalness: 0.12,
-      roughness: 0.62
+      color: fillColor,
+      transparent: true,
+      opacity: fillOpacity,
+      roughness: 0.42,
+      metalness: 0.08
     })
   );
-  body.rotation.x = Math.PI / 2;
-  body.position.z = 0.1;
-
-  const heading = new THREE.Mesh(
-    new THREE.ConeGeometry(0.12, 0.32, 18),
-    new THREE.MeshStandardMaterial({
-      color: "#ffd166",
-      metalness: 0.05,
-      roughness: 0.45
-    })
-  );
-  heading.rotation.x = Math.PI / 2;
-  heading.position.set(0.24, 0, 0.1);
-  heading.rotation.z = -Math.PI / 2;
-
-  group.add(body);
-  group.add(heading);
+  const outline = createWireBox(width, depth, height, outlineColor, outlineOpacity);
+  group.add(mesh);
+  group.add(outline);
   return group;
 }
 
-function createTrajectoryPoseMarker(color: THREE.Color): THREE.Object3D {
-  const positions = [
-    0, 0, 0,
-    0.22, 0.12, 0.08,
-    0, 0, 0,
-    0.22, -0.12, 0.08,
-    0, 0, 0,
-    0.22, -0.12, -0.08,
-    0, 0, 0,
-    0.22, 0.12, -0.08,
-    0.22, 0.12, 0.08,
-    0.22, -0.12, 0.08,
-    0.22, -0.12, 0.08,
-    0.22, -0.12, -0.08,
-    0.22, -0.12, -0.08,
-    0.22, 0.12, -0.08,
-    0.22, 0.12, -0.08,
-    0.22, 0.12, 0.08
+function createFrustumMarker(color: THREE.Color, scale: number, opacity: number): THREE.Object3D {
+  const group = new THREE.Group();
+  const near = 0.02 * scale;
+  const far = 0.32 * scale;
+  const halfNearY = 0.035 * scale;
+  const halfNearZ = 0.025 * scale;
+  const halfFarY = 0.14 * scale;
+  const halfFarZ = 0.11 * scale;
+
+  const corners = {
+    nl: new THREE.Vector3(near, -halfNearY, halfNearZ),
+    nr: new THREE.Vector3(near, halfNearY, halfNearZ),
+    nbl: new THREE.Vector3(near, -halfNearY, -halfNearZ),
+    nbr: new THREE.Vector3(near, halfNearY, -halfNearZ),
+    fl: new THREE.Vector3(far, -halfFarY, halfFarZ),
+    fr: new THREE.Vector3(far, halfFarY, halfFarZ),
+    fbl: new THREE.Vector3(far, -halfFarY, -halfFarZ),
+    fbr: new THREE.Vector3(far, halfFarY, -halfFarZ),
+  };
+
+  const segments = [
+    new THREE.Vector3(0, 0, 0), corners.fl,
+    new THREE.Vector3(0, 0, 0), corners.fr,
+    new THREE.Vector3(0, 0, 0), corners.fbl,
+    new THREE.Vector3(0, 0, 0), corners.fbr,
+    corners.fl, corners.fr,
+    corners.fr, corners.fbr,
+    corners.fbr, corners.fbl,
+    corners.fbl, corners.fl,
+    corners.nl, corners.nr,
+    corners.nr, corners.nbr,
+    corners.nbr, corners.nbl,
+    corners.nbl, corners.nl,
   ];
 
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  const material = new THREE.LineBasicMaterial({
-    color,
-    transparent: true,
-    opacity: 0.82,
-    depthWrite: false
-  });
-  return new THREE.LineSegments(geometry, material);
+  const geometry = new THREE.BufferGeometry().setFromPoints(segments);
+  const lines = new THREE.LineSegments(
+    geometry,
+    new THREE.LineBasicMaterial({
+      color,
+      transparent: true,
+      opacity,
+      depthTest: false,
+      depthWrite: false
+    })
+  );
+  lines.renderOrder = 22;
+
+  const body = new THREE.Mesh(
+    new THREE.ConeGeometry(0.04 * scale, 0.12 * scale, 4),
+    new THREE.MeshStandardMaterial({
+      color,
+      transparent: true,
+      opacity: Math.min(opacity, 0.72),
+      depthTest: false,
+      depthWrite: false,
+      roughness: 0.5,
+      metalness: 0.08
+    })
+  );
+  body.rotation.z = -Math.PI / 2;
+  body.position.set(-0.02 * scale, 0, 0);
+  body.renderOrder = 21;
+
+  group.add(lines);
+  group.add(body);
+  return group;
 }
 
 function createPointSpriteTexture(): THREE.Texture {
@@ -1502,6 +2060,38 @@ function getGaussianSourceKey(source: SceneManifest["gaussian"] | undefined): st
     return `${source.format}:${source.url}`;
   }
   return null;
+}
+
+function splitGaussianChunksByBudget(
+  chunks: GaussianChunk[],
+  variant: string
+): [GaussianChunk[], GaussianChunk[]] {
+  if (!chunks.length) {
+    return [[], []];
+  }
+
+  const budget =
+    GAUSSIAN_INITIAL_BYTE_BUDGET[
+      (variant in GAUSSIAN_INITIAL_BYTE_BUDGET
+        ? variant
+        : "quality") as keyof typeof GAUSSIAN_INITIAL_BYTE_BUDGET
+    ];
+
+  const initial: GaussianChunk[] = [];
+  const deferred: GaussianChunk[] = [];
+  let usedBytes = 0;
+
+  for (const chunk of chunks) {
+    const bytes = chunk.bytes ?? 0;
+    if (!initial.length || (initial.length < 4 && usedBytes + bytes <= budget)) {
+      initial.push(chunk);
+      usedBytes += bytes;
+    } else {
+      deferred.push(chunk);
+    }
+  }
+
+  return [initial, deferred];
 }
 
 function boxFromChunkBounds(bounds: NonNullable<GaussianChunk["bounds"]>): THREE.Box3 {
@@ -1576,6 +2166,22 @@ function combineChunkBounds(chunks: GaussianChunk[]): THREE.Box3 | null {
   return combined;
 }
 
+function clonePointCloudSnapshot(source: THREE.Points): THREE.Points {
+  const geometry = (source.geometry as THREE.BufferGeometry).clone();
+  geometry.setDrawRange(
+    source.geometry.drawRange.start,
+    source.geometry.drawRange.count
+  );
+  const material = (source.material as THREE.PointsMaterial).clone();
+  const clone = new THREE.Points(geometry, material);
+  clone.frustumCulled = false;
+  clone.renderOrder = source.renderOrder;
+  clone.position.copy(source.position);
+  clone.quaternion.copy(source.quaternion);
+  clone.scale.copy(source.scale);
+  return clone;
+}
+
 function orderGaussianChunks(
   chunks: GaussianChunk[],
   cameraPosition: THREE.Vector3,
@@ -1599,6 +2205,68 @@ function disposeObject(object: THREE.Object3D): void {
       }
     }
   });
+}
+
+function smoothTrajectoryPath(path: Pose3D[], densityMultiplier: number): Pose3D[] {
+  if (path.length < 3) {
+    return path;
+  }
+
+  const points = path.map(
+    (pose) => new THREE.Vector3(pose.position.x, pose.position.y, pose.position.z)
+  );
+  const curve = new THREE.CatmullRomCurve3(points, false, "centripetal", 0.45);
+  const sampleCount = Math.min(Math.max(path.length * densityMultiplier, path.length + 1, 24), 4096);
+  const sampled = curve.getPoints(sampleCount - 1);
+  if (sampled.length <= path.length) {
+    return path;
+  }
+
+  const smoothed: Pose3D[] = [];
+  for (let index = 0; index < sampled.length; index += 1) {
+    const sourceFloat = (index / Math.max(sampled.length - 1, 1)) * (path.length - 1);
+    const leftIndex = Math.floor(sourceFloat);
+    const rightIndex = Math.min(path.length - 1, leftIndex + 1);
+    const mix = sourceFloat - leftIndex;
+    const leftPose = path[leftIndex];
+    const rightPose = path[rightIndex];
+    const point = sampled[index];
+    const orientation = new THREE.Quaternion(
+      leftPose.orientation.x,
+      leftPose.orientation.y,
+      leftPose.orientation.z,
+      leftPose.orientation.w
+    ).slerp(
+      new THREE.Quaternion(
+        rightPose.orientation.x,
+        rightPose.orientation.y,
+        rightPose.orientation.z,
+        rightPose.orientation.w
+      ),
+      mix
+    );
+
+    smoothed.push({
+      frameId: leftPose.frameId || rightPose.frameId,
+      stampMs:
+        leftPose.stampMs !== undefined && rightPose.stampMs !== undefined
+          ? Math.round(leftPose.stampMs + (rightPose.stampMs - leftPose.stampMs) * mix)
+          : leftPose.stampMs ?? rightPose.stampMs,
+      position: {
+        x: point.x,
+        y: point.y,
+        z: point.z
+      },
+      orientation: {
+        x: orientation.x,
+        y: orientation.y,
+        z: orientation.z,
+        w: orientation.w
+      }
+    });
+  }
+
+  return smoothed;
 }
 
 function computePointCloudBounds(positions: Float32Array): THREE.Box3 | null {
@@ -1668,6 +2336,78 @@ function samplePointCloudForRender(cloud: DecodedPointCloud, maxPoints: number):
         : colors
           ? colors.slice(0, renderIndex * 3)
           : undefined
+  };
+}
+
+function samplePointCloudPrioritizingColor(
+  cloud: DecodedPointCloud,
+  maxPoints: number
+): DecodedPointCloud {
+  if (
+    cloud.renderedPointCount <= maxPoints ||
+    !cloud.colors ||
+    cloud.colors.length !== cloud.positions.length
+  ) {
+    return samplePointCloudForRender(cloud, maxPoints);
+  }
+
+  const vividIndices: number[] = [];
+  const neutralIndices: number[] = [];
+  for (let pointIndex = 0; pointIndex < cloud.renderedPointCount; pointIndex += 1) {
+    const offset = pointIndex * 3;
+    const r = cloud.colors[offset];
+    const g = cloud.colors[offset + 1];
+    const b = cloud.colors[offset + 2];
+    const span = Math.max(r, g, b) - Math.min(r, g, b);
+    const neutralDistance =
+      Math.abs(r - 160 / 255) + Math.abs(g - 165 / 255) + Math.abs(b - 174 / 255);
+    if (span >= 0.12 || neutralDistance >= 0.18) {
+      vividIndices.push(pointIndex);
+    } else {
+      neutralIndices.push(pointIndex);
+    }
+  }
+
+  const selected = new Array<number>();
+  if (vividIndices.length >= maxPoints) {
+    for (let index = 0; index < maxPoints; index += 1) {
+      selected.push(vividIndices[Math.floor((index * vividIndices.length) / maxPoints)]);
+    }
+  } else {
+    selected.push(...vividIndices);
+    const remaining = maxPoints - selected.length;
+    if (remaining > 0) {
+      if (neutralIndices.length <= remaining) {
+        selected.push(...neutralIndices);
+      } else {
+        for (let index = 0; index < remaining; index += 1) {
+          selected.push(neutralIndices[Math.floor((index * neutralIndices.length) / remaining)]);
+        }
+      }
+    }
+  }
+
+  selected.sort((left, right) => left - right);
+  const positions = new Float32Array(selected.length * 3);
+  const colors = new Float32Array(selected.length * 3);
+  for (let renderIndex = 0; renderIndex < selected.length; renderIndex += 1) {
+    const sourceOffset = selected[renderIndex] * 3;
+    const targetOffset = renderIndex * 3;
+    positions[targetOffset] = cloud.positions[sourceOffset];
+    positions[targetOffset + 1] = cloud.positions[sourceOffset + 1];
+    positions[targetOffset + 2] = cloud.positions[sourceOffset + 2];
+    colors[targetOffset] = cloud.colors[sourceOffset];
+    colors[targetOffset + 1] = cloud.colors[sourceOffset + 1];
+    colors[targetOffset + 2] = cloud.colors[sourceOffset + 2];
+  }
+
+  return {
+    frameId: cloud.frameId,
+    stampMs: cloud.stampMs,
+    sourcePointCount: cloud.sourcePointCount,
+    renderedPointCount: selected.length,
+    positions,
+    colors
   };
 }
 
