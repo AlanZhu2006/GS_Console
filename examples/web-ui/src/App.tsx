@@ -300,6 +300,8 @@ export default function App() {
   const [playbackOverlayFrameIndex, setPlaybackOverlayFrameIndex] = useState<number | null>(null);
   const [playbackOverlayAccumulatedPointCloud, setPlaybackOverlayAccumulatedPointCloud] =
     useState<DecodedPointCloud | null>(null);
+  const [playbackLocalAccumulatedPointCloud, setPlaybackLocalAccumulatedPointCloud] =
+    useState<DecodedPointCloud | null>(null);
   const playbackStreamSourcePoseRef = useRef<Pose3D | null>(null);
   const playbackHiFiPoseBusyRef = useRef(false);
   const hifiManifestCameraRef = useRef<SceneManifest["camera"] | undefined>(undefined);
@@ -336,10 +338,24 @@ export default function App() {
   const playbackVideoInitializingRef = useRef(false);
   const playbackOverlayAbortRef = useRef<AbortController | null>(null);
   const playbackOverlayFetchInFlightRef = useRef(false);
-  const playbackOverlayDesiredRef = useRef<{ frameIndex: number; tailSec: number } | null>(null);
+  const playbackOverlayDesiredRef = useRef<{
+    frameIndex: number;
+    tailSec: number;
+    scanMaxPoints: number;
+    scanHistoryFrames: number;
+  } | null>(null);
   const playbackOverlayLoadedKeyRef = useRef<string | null>(null);
   const playbackOverlayLastRequestedFrameRef = useRef<number | null>(null);
   const playbackOverlayLastRequestWallRef = useRef(0);
+  const playbackOverlayMapAbortRef = useRef<AbortController | null>(null);
+  const playbackOverlayMapFetchInFlightRef = useRef(false);
+  const playbackOverlayMapDesiredRef = useRef<{
+    frameIndex: number;
+    mapMaxPoints: number;
+  } | null>(null);
+  const playbackOverlayMapLoadedKeyRef = useRef<string | null>(null);
+  const playbackOverlayMapLastRequestedFrameRef = useRef<number | null>(null);
+  const playbackOverlayMapLastRequestWallRef = useRef(0);
   const playbackOverlayAccumulationRef = useRef<PlaybackLocalMapState>({
     voxels: new Map(),
     order: [],
@@ -576,6 +592,63 @@ export default function App() {
   const playbackShowcase =
     playbackShowcaseEnabled && consoleMode === "playback" && playbackPresentation === "showcase";
   const playbackCinemaLayout = consoleMode === "playback" && !playbackShowcase;
+  const playbackEffectiveRate = useMemo(() => {
+    if (consoleMode !== "playback") {
+      return 1;
+    }
+    const rateCandidates = [
+      playbackStatus?.rate,
+      playbackVideoRate,
+      playbackVideoPaused ? 1 : null
+    ];
+    let best = 1;
+    for (const candidate of rateCandidates) {
+      if (typeof candidate === "number" && Number.isFinite(candidate) && candidate > 0) {
+        best = Math.max(best, candidate);
+      }
+    }
+    return best;
+  }, [consoleMode, playbackStatus?.rate, playbackVideoPaused, playbackVideoRate]);
+  const playbackStatusPollMs = useMemo(() => {
+    if (consoleMode !== "playback" || playbackVideoPaused) {
+      return 120;
+    }
+    if (playbackEffectiveRate >= 4) {
+      return 55;
+    }
+    if (playbackEffectiveRate >= 2) {
+      return 80;
+    }
+    return 120;
+  }, [consoleMode, playbackEffectiveRate, playbackVideoPaused]);
+  const playbackOverlayPolicy = useMemo(() => {
+    const fast = playbackEffectiveRate >= 4;
+    const medium = playbackEffectiveRate >= 2;
+    if (playbackShowcase) {
+      return {
+        scanMaxPoints: fast ? 12_000 : medium ? 11_000 : 10_000,
+        scanHistoryFrames: fast ? 5 : medium ? 4 : 3,
+        mapMaxPoints: fast ? 24_000 : medium ? 28_000 : 32_000,
+        minRequestGapMs: fast ? 40 : medium ? 60 : 80,
+        mapRequestGapMs: fast ? 180 : medium ? 240 : 320,
+        minFrameDelta: 1,
+        mapMinFrameDelta: fast ? 2 : medium ? 2 : 1,
+        localAccumulatedMaxPoints: fast ? 360_000 : medium ? 440_000 : 520_000,
+        localAccumulatedVoxelSize: fast ? 0.085 : 0.08
+      };
+    }
+    return {
+      scanMaxPoints: fast ? 10_000 : medium ? 9_200 : 8_000,
+      scanHistoryFrames: fast ? 4 : medium ? 3 : 2,
+      mapMaxPoints: fast ? 12_000 : medium ? 16_000 : 20_000,
+      minRequestGapMs: fast ? 45 : medium ? 65 : 95,
+      mapRequestGapMs: fast ? 220 : medium ? 300 : 380,
+      minFrameDelta: 1,
+      mapMinFrameDelta: fast ? 2 : medium ? 2 : 1,
+      localAccumulatedMaxPoints: fast ? 180_000 : medium ? 240_000 : 300_000,
+      localAccumulatedVoxelSize: fast ? 0.1 : 0.09
+    };
+  }, [playbackEffectiveRate, playbackShowcase]);
   const playbackCloudOptions = useMemo<PlaybackCloudOptions>(
     () => ({
       enabled: true,
@@ -759,6 +832,39 @@ export default function App() {
   );
   const playbackOverlayRobotPose = playbackOverlayTrajectory?.at(-1) ?? null;
   useEffect(() => {
+    if (consoleMode !== "playback" || !playbackOverlayScanPointCloud || playbackOverlayFrameIndex === null) {
+      return;
+    }
+
+    const state = playbackOverlayAccumulationRef.current;
+    if (
+      state.lastFrameIndex === null ||
+      playbackOverlayFrameIndex <= state.lastFrameIndex ||
+      playbackOverlayFrameIndex - state.lastFrameIndex > 48
+    ) {
+      playbackOverlayAccumulationRef.current = {
+        voxels: new Map(),
+        order: [],
+        lastFrameIndex: null
+      };
+    }
+
+    const nextCloud = accumulatePlaybackOverlayMap(
+      playbackOverlayAccumulationRef.current,
+      playbackOverlayScanPointCloud,
+      playbackOverlayFrameIndex,
+      playbackOverlayPolicy.localAccumulatedMaxPoints,
+      playbackOverlayPolicy.localAccumulatedVoxelSize
+    );
+    setPlaybackLocalAccumulatedPointCloud(nextCloud);
+  }, [
+    consoleMode,
+    playbackOverlayFrameIndex,
+    playbackOverlayPolicy.localAccumulatedMaxPoints,
+    playbackOverlayPolicy.localAccumulatedVoxelSize,
+    playbackOverlayScanPointCloud
+  ]);
+  useEffect(() => {
     if (consoleMode !== "playback") {
       setPlaybackResolvedMapPointCloud(null);
       return;
@@ -767,6 +873,7 @@ export default function App() {
     const nextMap =
       playbackOverlayAccumulatedPointCloud ??
       rosState.playbackAccumulatedPointCloud ??
+      playbackLocalAccumulatedPointCloud ??
       null;
     if (!nextMap || nextMap.renderedPointCount < 1) {
       return;
@@ -774,6 +881,7 @@ export default function App() {
     setPlaybackResolvedMapPointCloud(nextMap);
   }, [
     consoleMode,
+    playbackLocalAccumulatedPointCloud,
     playbackOverlayAccumulatedPointCloud,
     rosState.playbackAccumulatedPointCloud
   ]);
@@ -795,7 +903,6 @@ export default function App() {
         ? pickPlaybackAccumulatedMapPointCloudForTarget(
             playbackTargetStampMs,
             playbackResolvedMapPointCloud,
-            playbackOverlayAccumulatedPointCloud,
             playbackOverlayScan,
             rosState.playbackScanPointCloud,
             rosState.livePointCloud
@@ -804,7 +911,6 @@ export default function App() {
     [
       activeMapPointCloud,
       consoleMode,
-      playbackOverlayAccumulatedPointCloud,
       playbackOverlayScan,
       playbackResolvedMapPointCloud,
       playbackTargetStampMs,
@@ -1060,7 +1166,7 @@ export default function App() {
     }, 2000);
 
     void loadStatus();
-    const intervalId = window.setInterval(loadStatus, 120);
+    const intervalId = window.setInterval(loadStatus, playbackStatusPollMs);
     return () => {
       disposed = true;
       window.clearTimeout(warmupTimerId);
@@ -1068,7 +1174,7 @@ export default function App() {
       playbackStatusRequestInFlightRef.current = false;
       playbackStatusFailureCountRef.current = 0;
     };
-  }, [consoleMode, playbackApiUrl]);
+  }, [consoleMode, playbackApiUrl, playbackStatusPollMs]);
 
   useEffect(() => {
     playbackVideoInitializedRef.current = false;
@@ -1086,6 +1192,13 @@ export default function App() {
     playbackOverlayFetchInFlightRef.current = false;
     playbackOverlayAbortRef.current?.abort();
     playbackOverlayAbortRef.current = null;
+    playbackOverlayMapDesiredRef.current = null;
+    playbackOverlayMapLoadedKeyRef.current = null;
+    playbackOverlayMapLastRequestedFrameRef.current = null;
+    playbackOverlayMapLastRequestWallRef.current = 0;
+    playbackOverlayMapFetchInFlightRef.current = false;
+    playbackOverlayMapAbortRef.current?.abort();
+    playbackOverlayMapAbortRef.current = null;
     setPlaybackOverlayTrajectory(null);
     setPlaybackOverlayScanPointCloud(null);
     setPlaybackOverlayFrameIndex(null);
@@ -1095,6 +1208,7 @@ export default function App() {
       lastFrameIndex: null
     };
     setPlaybackOverlayAccumulatedPointCloud(null);
+    setPlaybackLocalAccumulatedPointCloud(null);
     setPlaybackResolvedMapPointCloud(null);
     setPlaybackError(null);
     refreshPlaybackVideoState();
@@ -1194,7 +1308,7 @@ export default function App() {
     };
   }, [consoleMode, playbackApiUrl]);
 
-  const pumpPlaybackOverlay = useCallback(async () => {
+  const pumpPlaybackOverlayScan = useCallback(async () => {
     if (consoleMode !== "playback" || playbackOverlayFetchInFlightRef.current) {
       return;
     }
@@ -1205,7 +1319,12 @@ export default function App() {
         return;
       }
 
-      const desiredKey = `${desired.frameIndex}:${desired.tailSec.toFixed(3)}`;
+      const desiredKey = [
+        desired.frameIndex,
+        desired.tailSec.toFixed(3),
+        desired.scanMaxPoints,
+        desired.scanHistoryFrames
+      ].join(":");
       if (playbackOverlayLoadedKeyRef.current === desiredKey) {
         return;
       }
@@ -1218,16 +1337,13 @@ export default function App() {
       const candidates = buildControlUrlCandidates(playbackApiUrl, "/__playback_control", 8765);
       for (const candidate of candidates) {
         try {
-          const overlayScanMaxPoints = playbackShowcase ? "9000" : "7200";
-          const overlayScanHistoryFrames = playbackShowcase ? "2" : "1";
-          const overlayMapMaxPoints = playbackShowcase ? "6000" : "3000";
           const query = new URLSearchParams({
             frameIndex: String(desired.frameIndex),
             trajectoryMaxPoints: "1",
             trajectoryTailSec: "0",
-            scanMaxPoints: overlayScanMaxPoints,
-            scanHistoryFrames: overlayScanHistoryFrames,
-            mapMaxPoints: overlayMapMaxPoints
+            scanMaxPoints: String(desired.scanMaxPoints),
+            scanHistoryFrames: String(desired.scanHistoryFrames),
+            mapMaxPoints: "0"
           });
           const response = await fetch(`${candidate}/overlay.json?${query.toString()}`, {
             cache: "no-store",
@@ -1246,9 +1362,6 @@ export default function App() {
           }
           setPlaybackOverlayTrajectory(payload.trajectory ?? []);
           setPlaybackOverlayScanPointCloud(decodePlaybackOverlayScan(payload.scan));
-          setPlaybackOverlayAccumulatedPointCloud(
-            payload.map ? decodePlaybackOverlayScan(payload.map) : null
-          );
           setPlaybackOverlayFrameIndex(payload.frameIndex ?? desired.frameIndex);
           playbackOverlayLoadedKeyRef.current = desiredKey;
           loaded = true;
@@ -1273,12 +1386,99 @@ export default function App() {
       }
 
       const latest = playbackOverlayDesiredRef.current;
-      const latestKey = latest ? `${latest.frameIndex}:${latest.tailSec.toFixed(3)}` : null;
+      const latestKey = latest
+        ? [
+            latest.frameIndex,
+            latest.tailSec.toFixed(3),
+            latest.scanMaxPoints,
+            latest.scanHistoryFrames
+          ].join(":")
+        : null;
       if (!latestKey || latestKey === desiredKey) {
         return;
       }
     }
-  }, [consoleMode, playbackApiUrl, playbackShowcase]);
+  }, [consoleMode, playbackApiUrl]);
+
+  const pumpPlaybackOverlayMap = useCallback(async () => {
+    if (consoleMode !== "playback" || playbackOverlayMapFetchInFlightRef.current) {
+      return;
+    }
+
+    while (true) {
+      const desired = playbackOverlayMapDesiredRef.current;
+      if (!desired) {
+        return;
+      }
+
+      const desiredKey = `${desired.frameIndex}:${desired.mapMaxPoints}`;
+      if (playbackOverlayMapLoadedKeyRef.current === desiredKey) {
+        return;
+      }
+
+      playbackOverlayMapFetchInFlightRef.current = true;
+      const controller = new AbortController();
+      playbackOverlayMapAbortRef.current = controller;
+      let loaded = false;
+
+      const candidates = buildControlUrlCandidates(playbackApiUrl, "/__playback_control", 8765);
+      for (const candidate of candidates) {
+        try {
+          const query = new URLSearchParams({
+            frameIndex: String(desired.frameIndex),
+            trajectoryMaxPoints: "0",
+            trajectoryTailSec: "0",
+            scanMaxPoints: "0",
+            scanHistoryFrames: "0",
+            mapMaxPoints: String(desired.mapMaxPoints)
+          });
+          const response = await fetch(`${candidate}/overlay.json?${query.toString()}`, {
+            cache: "no-store",
+            signal: controller.signal
+          });
+          if (!response.ok) {
+            throw new Error(`Playback overlay map returned ${response.status}`);
+          }
+          const payload = (await response.json()) as PlaybackOverlayState;
+          if (controller.signal.aborted) {
+            playbackOverlayMapFetchInFlightRef.current = false;
+            return;
+          }
+          if (candidate !== playbackApiUrl) {
+            setPlaybackApiUrl(candidate);
+          }
+          setPlaybackOverlayAccumulatedPointCloud(
+            payload.map ? decodePlaybackOverlayScan(payload.map) : null
+          );
+          playbackOverlayMapLoadedKeyRef.current = desiredKey;
+          loaded = true;
+          break;
+        } catch (error) {
+          if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+            playbackOverlayMapFetchInFlightRef.current = false;
+            return;
+          }
+          continue;
+        }
+      }
+
+      playbackOverlayMapFetchInFlightRef.current = false;
+      if (playbackOverlayMapAbortRef.current === controller) {
+        playbackOverlayMapAbortRef.current = null;
+      }
+
+      if (!loaded) {
+        playbackOverlayMapLoadedKeyRef.current = null;
+        return;
+      }
+
+      const latest = playbackOverlayMapDesiredRef.current;
+      const latestKey = latest ? `${latest.frameIndex}:${latest.mapMaxPoints}` : null;
+      if (!latestKey || latestKey === desiredKey) {
+        return;
+      }
+    }
+  }, [consoleMode, playbackApiUrl]);
 
   useEffect(() => {
     if (consoleMode !== "playback") {
@@ -1289,9 +1489,18 @@ export default function App() {
       playbackOverlayFetchInFlightRef.current = false;
       playbackOverlayAbortRef.current?.abort();
       playbackOverlayAbortRef.current = null;
+      playbackOverlayMapDesiredRef.current = null;
+      playbackOverlayMapLoadedKeyRef.current = null;
+      playbackOverlayMapLastRequestedFrameRef.current = null;
+      playbackOverlayMapLastRequestWallRef.current = 0;
+      playbackOverlayMapFetchInFlightRef.current = false;
+      playbackOverlayMapAbortRef.current?.abort();
+      playbackOverlayMapAbortRef.current = null;
       setPlaybackOverlayTrajectory(null);
       setPlaybackOverlayScanPointCloud(null);
       setPlaybackOverlayFrameIndex(null);
+      setPlaybackOverlayAccumulatedPointCloud(null);
+      setPlaybackLocalAccumulatedPointCloud(null);
       return;
     }
 
@@ -1303,8 +1512,8 @@ export default function App() {
     const now = performance.now();
     const lastRequestedFrame = playbackOverlayLastRequestedFrameRef.current;
     const lastRequestedWall = playbackOverlayLastRequestWallRef.current;
-    const minFrameDelta = playbackShowcase ? 2 : 1;
-    const minRequestGapMs = playbackShowcase ? 95 : 120;
+    const minFrameDelta = playbackOverlayPolicy.minFrameDelta;
+    const minRequestGapMs = playbackOverlayPolicy.minRequestGapMs;
     const playing = !playbackVideoPausedStateRef.current;
     if (
       playing &&
@@ -1320,10 +1529,45 @@ export default function App() {
     playbackOverlayLastRequestWallRef.current = now;
     playbackOverlayDesiredRef.current = {
       frameIndex,
-      tailSec: 0
+      tailSec: 0,
+      scanMaxPoints: playbackOverlayPolicy.scanMaxPoints,
+      scanHistoryFrames: playbackOverlayPolicy.scanHistoryFrames
     };
-    void pumpPlaybackOverlay();
-  }, [consoleMode, playbackShowcase, playbackVisualPlaybackFrameIndex, pumpPlaybackOverlay]);
+    void pumpPlaybackOverlayScan();
+  }, [consoleMode, playbackOverlayPolicy, playbackVisualPlaybackFrameIndex, pumpPlaybackOverlayScan]);
+
+  useEffect(() => {
+    if (consoleMode !== "playback") {
+      return;
+    }
+
+    const frameIndex = playbackVisualPlaybackFrameIndex;
+    if (frameIndex === undefined || frameIndex === null || frameIndex < 0) {
+      return;
+    }
+
+    const now = performance.now();
+    const lastRequestedFrame = playbackOverlayMapLastRequestedFrameRef.current;
+    const lastRequestedWall = playbackOverlayMapLastRequestWallRef.current;
+    const playing = !playbackVideoPausedStateRef.current;
+    if (
+      playing &&
+      lastRequestedFrame !== null &&
+      frameIndex >= lastRequestedFrame &&
+      frameIndex - lastRequestedFrame < playbackOverlayPolicy.mapMinFrameDelta &&
+      now - lastRequestedWall < playbackOverlayPolicy.mapRequestGapMs
+    ) {
+      return;
+    }
+
+    playbackOverlayMapLastRequestedFrameRef.current = frameIndex;
+    playbackOverlayMapLastRequestWallRef.current = now;
+    playbackOverlayMapDesiredRef.current = {
+      frameIndex,
+      mapMaxPoints: playbackOverlayPolicy.mapMaxPoints
+    };
+    void pumpPlaybackOverlayMap();
+  }, [consoleMode, playbackOverlayPolicy, playbackVisualPlaybackFrameIndex, pumpPlaybackOverlayMap]);
 
   useEffect(() => {
     playbackVideoLastSyncSignatureRef.current = null;
@@ -1708,8 +1952,24 @@ export default function App() {
     playbackOverlayFetchInFlightRef.current = false;
     playbackOverlayAbortRef.current?.abort();
     playbackOverlayAbortRef.current = null;
+    playbackOverlayMapDesiredRef.current = null;
+    playbackOverlayMapLoadedKeyRef.current = null;
+    playbackOverlayMapLastRequestedFrameRef.current = null;
+    playbackOverlayMapLastRequestWallRef.current = 0;
+    playbackOverlayMapFetchInFlightRef.current = false;
+    playbackOverlayMapAbortRef.current?.abort();
+    playbackOverlayMapAbortRef.current = null;
     setPlaybackOverlayTrajectory(null);
     setPlaybackOverlayScanPointCloud(null);
+    setPlaybackOverlayFrameIndex(null);
+    playbackOverlayAccumulationRef.current = {
+      voxels: new Map(),
+      order: [],
+      lastFrameIndex: null
+    };
+    setPlaybackOverlayAccumulatedPointCloud(null);
+    setPlaybackLocalAccumulatedPointCloud(null);
+    setPlaybackResolvedMapPointCloud(null);
     await seekPlaybackVideo(playbackVideoDraftTimeSec);
     setPlaybackVideoDraftTimeSec(null);
     await syncPlaybackToMasterVideo(true);
@@ -1742,6 +2002,13 @@ export default function App() {
         playbackOverlayFetchInFlightRef.current = false;
         playbackOverlayAbortRef.current?.abort();
         playbackOverlayAbortRef.current = null;
+        playbackOverlayMapDesiredRef.current = null;
+        playbackOverlayMapLoadedKeyRef.current = null;
+        playbackOverlayMapLastRequestedFrameRef.current = null;
+        playbackOverlayMapLastRequestWallRef.current = 0;
+        playbackOverlayMapFetchInFlightRef.current = false;
+        playbackOverlayMapAbortRef.current?.abort();
+        playbackOverlayMapAbortRef.current = null;
         setPlaybackOverlayTrajectory(null);
         setPlaybackOverlayScanPointCloud(null);
         setPlaybackOverlayFrameIndex(null);
@@ -1751,6 +2018,7 @@ export default function App() {
           lastFrameIndex: null
         };
         setPlaybackOverlayAccumulatedPointCloud(null);
+        setPlaybackLocalAccumulatedPointCloud(null);
         setPlaybackResolvedMapPointCloud(null);
         await seekPlaybackVideo(0);
       }
@@ -1780,6 +2048,13 @@ export default function App() {
     playbackOverlayFetchInFlightRef.current = false;
     playbackOverlayAbortRef.current?.abort();
     playbackOverlayAbortRef.current = null;
+    playbackOverlayMapDesiredRef.current = null;
+    playbackOverlayMapLoadedKeyRef.current = null;
+    playbackOverlayMapLastRequestedFrameRef.current = null;
+    playbackOverlayMapLastRequestWallRef.current = 0;
+    playbackOverlayMapFetchInFlightRef.current = false;
+    playbackOverlayMapAbortRef.current?.abort();
+    playbackOverlayMapAbortRef.current = null;
     setPlaybackOverlayTrajectory(null);
     setPlaybackOverlayScanPointCloud(null);
     setPlaybackOverlayFrameIndex(null);
@@ -1789,6 +2064,7 @@ export default function App() {
       lastFrameIndex: null
     };
     setPlaybackOverlayAccumulatedPointCloud(null);
+    setPlaybackLocalAccumulatedPointCloud(null);
     setPlaybackResolvedMapPointCloud(null);
     await seekPlaybackVideo(0);
     setPlaybackVideoDraftTimeSec(null);
@@ -4112,55 +4388,10 @@ function buildPlaybackLocalMapPointCloud(
 function pickPlaybackAccumulatedMapPointCloudForTarget(
   targetStampMs: number | null,
   resolvedAccumulatedMap: DecodedPointCloud | null | undefined,
-  overlayAccumulatedMap: DecodedPointCloud | null | undefined,
   ...fallbackScans: Array<DecodedPointCloud | null | undefined>
 ): DecodedPointCloud | null {
-  if (
-    overlayAccumulatedMap &&
-    (overlayAccumulatedMap.renderedPointCount ?? 0) > 0 &&
-    targetStampMs !== null &&
-    Number.isFinite(targetStampMs)
-  ) {
-    const overlayDelta = Math.abs((overlayAccumulatedMap.stampMs ?? 0) - targetStampMs);
-    const resolvedDelta = resolvedAccumulatedMap
-      ? Math.abs((resolvedAccumulatedMap.stampMs ?? 0) - targetStampMs)
-      : Number.POSITIVE_INFINITY;
-    if (overlayDelta <= resolvedDelta + 300) {
-      return overlayAccumulatedMap;
-    }
-  }
-
-  const cumulativeCandidates = [resolvedAccumulatedMap, overlayAccumulatedMap].filter(
-    (candidate): candidate is DecodedPointCloud =>
-      Boolean(candidate) && (candidate?.renderedPointCount ?? 0) > 0
-  );
-  if (cumulativeCandidates.length > 0) {
-    if (targetStampMs === null || !Number.isFinite(targetStampMs)) {
-      return cumulativeCandidates.reduce((best, candidate) =>
-        candidate.renderedPointCount > best.renderedPointCount ? candidate : best
-      );
-    }
-
-    let best = cumulativeCandidates[0];
-    let bestDelta = Math.abs((best.stampMs ?? 0) - targetStampMs);
-
-    for (const candidate of cumulativeCandidates.slice(1)) {
-      const candidateDelta = Math.abs((candidate.stampMs ?? 0) - targetStampMs);
-      if (candidateDelta + 120 < bestDelta) {
-        best = candidate;
-        bestDelta = candidateDelta;
-        continue;
-      }
-      if (
-        Math.abs(candidateDelta - bestDelta) <= 250 &&
-        candidate.renderedPointCount > best.renderedPointCount
-      ) {
-        best = candidate;
-        bestDelta = candidateDelta;
-      }
-    }
-
-    return best;
+  if (resolvedAccumulatedMap && (resolvedAccumulatedMap.renderedPointCount ?? 0) > 0) {
+    return resolvedAccumulatedMap;
   }
   const scanFallback = fallbackScans.find(
     (candidate) => Boolean(candidate) && (candidate?.renderedPointCount ?? 0) > 0

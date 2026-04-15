@@ -536,8 +536,11 @@ export class LiveGsViewer {
     this.trajectoryLine.renderOrder = 28;
     this.trajectoryLayer.add(this.trajectoryLine);
 
-    const markerStride = Math.max(1, Math.floor(path.length / (this.presentationMode === "showcase" ? 64 : 28)));
-    for (let index = 0; index < path.length; index += markerStride) {
+    const markerIndices = pickTrajectoryMarkerIndices(
+      path,
+      this.presentationMode === "showcase" && this.mode === "playback" ? 144 : 64
+    );
+    for (const index of markerIndices) {
       const pose = path[index];
       const t = path.length <= 1 ? 0 : index / (path.length - 1);
       const color = new THREE.Color().setHSL((1 - t) * 0.74, 0.88, 0.58);
@@ -2323,6 +2326,58 @@ function smoothTrajectoryPath(path: Pose3D[], densityMultiplier: number): Pose3D
   }
 
   return smoothed;
+}
+
+function pickTrajectoryMarkerIndices(path: Pose3D[], targetMarkers: number): number[] {
+  if (path.length <= 1) {
+    return path.length === 1 ? [0] : [];
+  }
+
+  const clampedTarget = Math.max(2, Math.min(targetMarkers, path.length));
+  if (clampedTarget >= path.length) {
+    return Array.from({ length: path.length }, (_, index) => index);
+  }
+
+  const cumulativeDistances = new Array<number>(path.length).fill(0);
+  for (let index = 1; index < path.length; index += 1) {
+    const prev = path[index - 1];
+    const curr = path[index];
+    cumulativeDistances[index] =
+      cumulativeDistances[index - 1] +
+      Math.hypot(
+        curr.position.x - prev.position.x,
+        curr.position.y - prev.position.y,
+        curr.position.z - prev.position.z
+      );
+  }
+
+  const totalDistance = cumulativeDistances[path.length - 1];
+  if (totalDistance <= 1e-6) {
+    const stride = Math.max(1, Math.floor(path.length / clampedTarget));
+    const indices: number[] = [];
+    for (let index = 0; index < path.length; index += stride) {
+      indices.push(index);
+    }
+    if (indices[indices.length - 1] !== path.length - 1) {
+      indices.push(path.length - 1);
+    }
+    return indices;
+  }
+
+  const indices: number[] = [0];
+  let nextTargetDistance = totalDistance / (clampedTarget - 1);
+  for (let index = 1; index < path.length - 1; index += 1) {
+    if (cumulativeDistances[index] + 1e-6 < nextTargetDistance) {
+      continue;
+    }
+    indices.push(index);
+    nextTargetDistance += totalDistance / (clampedTarget - 1);
+  }
+
+  if (indices[indices.length - 1] !== path.length - 1) {
+    indices.push(path.length - 1);
+  }
+  return indices;
 }
 
 function computePointCloudBounds(positions: Float32Array): THREE.Box3 | null {

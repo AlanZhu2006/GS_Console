@@ -175,7 +175,7 @@ export default function TopDownMap(props: TopDownMapProps) {
           const now = performance.now();
           if (
             playbackGridLastBuildRef.current > 0 &&
-            now - playbackGridLastBuildRef.current < 45
+            now - playbackGridLastBuildRef.current < 28
           ) {
             return;
           }

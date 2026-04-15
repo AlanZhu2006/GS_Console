@@ -932,41 +932,45 @@ class CachedPlaybackController:
                     break
                 trajectory_start_index -= 1
 
-        trajectory_limit = max(int(trajectory_max_points), 1)
-        trajectory_count = resolved_index - trajectory_start_index + 1
-        trajectory_stride = max(1, int(math.ceil(float(trajectory_count) / float(trajectory_limit))))
         trajectory: list[dict[str, Any]] = []
-        for index in range(trajectory_start_index, resolved_index + 1, trajectory_stride):
-            trajectory.append(self.build_pose_payload(self.frames[index]))
-        if trajectory and trajectory[-1]["stampMs"] != self.build_pose_payload(current_frame)["stampMs"]:
-            trajectory.append(self.build_pose_payload(current_frame))
+        if int(trajectory_max_points) > 0:
+            trajectory_limit = max(int(trajectory_max_points), 1)
+            trajectory_count = resolved_index - trajectory_start_index + 1
+            trajectory_stride = max(1, int(math.ceil(float(trajectory_count) / float(trajectory_limit))))
+            for index in range(trajectory_start_index, resolved_index + 1, trajectory_stride):
+                trajectory.append(self.build_pose_payload(self.frames[index]))
+            if trajectory and trajectory[-1]["stampMs"] != self.build_pose_payload(current_frame)["stampMs"]:
+                trajectory.append(self.build_pose_payload(current_frame))
 
-        scan_limit = max(int(scan_max_points), 1)
-        history_frames = max(
-            int(
-                scan_history_frames
-                if scan_history_frames is not None
-                else (getattr(self.args, "scan_history_frames", 4) or 1)
-            ),
-            1,
-        )
-        sampled_positions, sampled_colors = self.compose_recent_scan_cloud(
-            resolved_index,
-            scan_limit,
-            history_frames,
-        )
         scan_stamp_ms = int(round(float(current_frame["stampSec"]) * 1000.0))
-        return {
-            "frameIndex": resolved_index,
-            "trajectory": trajectory,
-            "scan": {
+        scan_payload: dict[str, Any] | None = None
+        if int(scan_max_points) > 0:
+            scan_limit = max(int(scan_max_points), 1)
+            history_frames = max(
+                int(
+                    scan_history_frames
+                    if scan_history_frames is not None
+                    else (getattr(self.args, "scan_history_frames", 4) or 1)
+                ),
+                1,
+            )
+            sampled_positions, sampled_colors = self.compose_recent_scan_cloud(
+                resolved_index,
+                scan_limit,
+                history_frames,
+            )
+            scan_payload = {
                 "frameId": "world",
                 "stampMs": scan_stamp_ms,
                 "renderedPointCount": int(sampled_positions.shape[0]),
                 "sourcePointCount": int(sampled_positions.shape[0]),
                 "positions": np.round(sampled_positions.reshape(-1), 4).astype(float).tolist(),
                 "colors": sampled_colors.reshape(-1).astype(int).tolist(),
-            },
+            }
+        return {
+            "frameIndex": resolved_index,
+            "trajectory": trajectory,
+            "scan": scan_payload,
             "map": self.build_overlay_map_payload(
                 resolved_index,
                 max_points=max(int(map_max_points), 0),
