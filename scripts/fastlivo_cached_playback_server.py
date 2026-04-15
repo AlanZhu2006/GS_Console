@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--video-path", default="")
     parser.add_argument("--video-fps", type=float, default=12.0)
-    parser.add_argument("--video-speed", type=float, default=8.0)
+    parser.add_argument("--video-speed", type=float, default=1.0)
     parser.add_argument("--video-start-offset", type=float, default=0.0)
     parser.add_argument("--video-end-offset", type=float, default=-1.0)
     parser.add_argument("--video-label", default="")
@@ -85,6 +85,24 @@ def load_cloud_npz(path_str: str) -> tuple[np.ndarray, np.ndarray]:
         positions = data["positions"].astype(np.float32, copy=False)
         colors = data["colors"].astype(np.uint8, copy=False)
     return positions, colors
+
+
+@functools.lru_cache(maxsize=384)
+def load_clean_cloud_npz(
+    path_str: str,
+    neutral_r: int,
+    neutral_g: int,
+    neutral_b: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    positions, colors = load_cloud_npz(path_str)
+    neutral_color = np.array([neutral_r, neutral_g, neutral_b], dtype=np.uint8)
+    cleaned_colors, legacy_mask = neutralize_legacy_false_colors(colors, neutral_color)
+    valid_mask = ~legacy_mask
+    return (
+        np.asarray(positions, dtype=np.float32, order="C"),
+        np.asarray(cleaned_colors, dtype=np.uint8, order="C"),
+        np.asarray(valid_mask, dtype=bool),
+    )
 
 
 @functools.lru_cache(maxsize=192)
@@ -328,7 +346,6 @@ def build_video_sync_map(
     selected_indices: list[int] = []
     selected_offsets: list[float] = []
     target = start_offset_sec
-    previous_index = -1
     while target <= end_offset_sec + 1e-6:
         index = bisect.bisect_left(frame_offsets, target)
         if index >= len(frame_offsets):
@@ -338,10 +355,11 @@ def build_video_sync_map(
             right = frame_offsets[index]
             if abs(target - left) <= abs(right - target):
                 index -= 1
-        if index != previous_index:
-            selected_indices.append(index)
-            selected_offsets.append(float(frame_offsets[index]))
-            previous_index = index
+        # Mirror export_playback_rgb_vs_gssdf_video.py exactly: keep duplicate source
+        # frames when exporting or synchronizing below the cache cadence. Deduping here
+        # shortens the sync table and makes video time drift ahead of bag time.
+        selected_indices.append(index)
+        selected_offsets.append(float(frame_offsets[index]))
         target += step
 
     if selected_indices and selected_indices[-1] != len(frame_offsets) - 1 and end_offset_sec >= duration_sec - 1e-3:
@@ -388,7 +406,7 @@ def load_playback_video_descriptor(cache_dir: Path, args: argparse.Namespace) ->
         return {
             "path": resolved,
             "fps": max(float(getattr(args, "video_fps", 12.0)), 1e-3),
-            "speed": max(float(getattr(args, "video_speed", 8.0)), 1e-3),
+            "speed": max(float(getattr(args, "video_speed", 1.0)), 1e-3),
             "startOffsetSec": float(getattr(args, "video_start_offset", 0.0)),
             "endOffsetSec": float(getattr(args, "video_end_offset", -1.0)),
             "label": str(getattr(args, "video_label", "") or "").strip() or "Offline playback video",
@@ -412,7 +430,7 @@ def load_playback_video_descriptor(cache_dir: Path, args: argparse.Namespace) ->
         return {
             "path": resolved,
             "fps": max(float(payload.get("fps", 12.0)), 1e-3),
-            "speed": max(float(payload.get("speed", 8.0)), 1e-3),
+            "speed": max(float(payload.get("speed", 1.0)), 1e-3),
             "startOffsetSec": float(payload.get("startOffsetSec", 0.0)),
             "endOffsetSec": float(payload.get("endOffsetSec", -1.0)),
             "label": str(payload.get("label") or "Offline playback video"),
@@ -523,6 +541,12 @@ class CachedPlaybackController:
         self.global_map_point_count = 0
         self.current_scan_point_count = 0
         self.current_frame_index = -1
+        self._overlay_map_cache_key: tuple[int, int] | None = None
+        self._overlay_map_cache_payload: dict[str, Any] | None = None
+        self._overlay_live_map_payloads: dict[int, dict[str, Any]] = {}
+        self._overlay_map_refresh_guard = threading.Lock()
+        self._overlay_map_refresh_busy = False
+        self._overlay_map_refresh_pending_frame_index: int | None = None
         self.stop_event = threading.Event()
         self._map_publish_guard = threading.Lock()
         self._map_publish_busy = False
@@ -885,6 +909,7 @@ class CachedPlaybackController:
         scan_max_points: int = 1600,
         trajectory_tail_sec: float = 0.0,
         scan_history_frames: int | None = None,
+        map_max_points: int = 0,
     ) -> dict[str, Any]:
         resolved_index = self.resolve_frame_index(frame_index)
         if resolved_index < 0 or resolved_index >= len(self.frames):
@@ -892,6 +917,7 @@ class CachedPlaybackController:
                 "frameIndex": -1,
                 "trajectory": [],
                 "scan": None,
+                "map": None,
             }
 
         current_frame = self.frames[resolved_index]
@@ -941,10 +967,18 @@ class CachedPlaybackController:
                 "positions": np.round(sampled_positions.reshape(-1), 4).astype(float).tolist(),
                 "colors": sampled_colors.reshape(-1).astype(int).tolist(),
             },
+            "map": self.build_overlay_map_payload(
+                resolved_index,
+                max_points=max(int(map_max_points), 0),
+            ),
         }
 
-    def restore_map_from_keyframe(self, frame_index: int) -> int:
-        self.global_map_voxels = {}
+    def restore_map_from_keyframe_into_voxels(
+        self,
+        frame_index: int,
+        voxels: dict[tuple[int, int, int], MapVoxel],
+    ) -> int:
+        voxels.clear()
         if not self.keyframe_indices:
             return -1
 
@@ -953,30 +987,26 @@ class CachedPlaybackController:
             return -1
 
         keyframe_frame_index = self.keyframe_indices[keyframe_slot]
-        positions, colors = load_cloud_npz(self.keyframe_files[keyframe_slot])
+        positions, restored_colors, restored_valid_mask = load_clean_cloud_npz(
+            self.keyframe_files[keyframe_slot],
+            int(WEB_MAP_NEUTRAL_FALLBACK[0]),
+            int(WEB_MAP_NEUTRAL_FALLBACK[1]),
+            int(WEB_MAP_NEUTRAL_FALLBACK[2]),
+        )
         keyframe_frame = self.frames[keyframe_frame_index]
         stamp_sec = float(keyframe_frame["stampSec"])
-        restored_colors, restored_valid_mask = self.reproject_colors_for_frame(
-            keyframe_frame,
-            positions,
-            colors,
-        )
-        restored_colors, _ = neutralize_legacy_false_colors(
-            restored_colors,
-            WEB_MAP_NEUTRAL_FALLBACK,
-            ~restored_valid_mask,
-        )
+        voxel_size = max(float(self.meta["mapVoxelSize"]), 1e-3)
 
         for index in range(positions.shape[0]):
             x = float(positions[index, 0])
             y = float(positions[index, 1])
             z = float(positions[index, 2])
             key = (
-                int(round(x / max(float(self.meta["mapVoxelSize"]), 1e-3))),
-                int(round(y / max(float(self.meta["mapVoxelSize"]), 1e-3))),
-                int(round(z / max(float(self.meta["mapVoxelSize"]), 1e-3))),
+                int(round(x / voxel_size)),
+                int(round(y / voxel_size)),
+                int(round(z / voxel_size)),
             )
-            self.global_map_voxels[key] = MapVoxel(
+            voxels[key] = MapVoxel(
                 x=x,
                 y=y,
                 z=z,
@@ -986,11 +1016,11 @@ class CachedPlaybackController:
                 last_seen_stamp_sec=stamp_sec,
             )
 
-        self.global_map_point_count = len(self.global_map_voxels)
         return keyframe_frame_index
 
-    def update_global_map_from_scan(
+    def update_map_voxels_from_scan(
         self,
+        voxels: dict[tuple[int, int, int], MapVoxel],
         positions: np.ndarray,
         colors: np.ndarray,
         stamp_sec: float,
@@ -998,7 +1028,6 @@ class CachedPlaybackController:
     ) -> None:
         voxel_size = max(float(self.meta.get("mapVoxelSize", 0.2)), 1e-3)
         max_points = int(self.meta.get("mapMaxPoints", 90_000))
-        voxels = self.global_map_voxels
         for index in range(positions.shape[0]):
             x = float(positions[index, 0])
             y = float(positions[index, 1])
@@ -1037,8 +1066,6 @@ class CachedPlaybackController:
                 existing.color_samples = 1
             else:
                 existing.color_samples += 1
-                # Keep showcase colors closer to the latest observation instead of
-                # drifting toward a long-horizon average.
                 if stale_gap_sec >= 0.45:
                     color_mix = 0.58
                 elif existing.color_samples <= 3:
@@ -1053,7 +1080,277 @@ class CachedPlaybackController:
             existing.last_seen_stamp_sec = stamp_sec
 
         trim_map_voxels(voxels, max_points)
-        self.global_map_point_count = len(voxels)
+
+    def build_map_payload_from_voxels(
+        self,
+        voxels: dict[tuple[int, int, int], MapVoxel],
+        snapshot_frame_index: int,
+        max_points: int,
+    ) -> dict[str, Any] | None:
+        if max_points <= 0 or not voxels:
+            return None
+
+        voxel_values = list(voxels.values())
+        return self.build_map_payload_from_voxel_values(
+            voxel_values,
+            snapshot_frame_index,
+            max_points,
+        )
+
+    def build_map_payload_from_voxel_values(
+        self,
+        voxel_values: list[MapVoxel],
+        snapshot_frame_index: int,
+        max_points: int,
+    ) -> dict[str, Any] | None:
+        if max_points <= 0 or not voxel_values:
+            return None
+
+        n = len(voxel_values)
+        positions = np.empty((n, 3), dtype=np.float32)
+        colors = np.empty((n, 3), dtype=np.uint8)
+        color_valid_mask = np.zeros((n,), dtype=bool)
+        default_rgb = np.array([216, 236, 255], dtype=np.uint8)
+        for index, voxel in enumerate(voxel_values):
+            positions[index, 0] = voxel.x
+            positions[index, 1] = voxel.y
+            positions[index, 2] = voxel.z
+            c = voxel.color
+            if c is None:
+                colors[index] = default_rgb
+            else:
+                colors[index] = np.clip(np.round(c), 0, 255).astype(np.uint8)
+            color_valid_mask[index] = bool((voxel.color is not None) and (voxel.color_samples > 0))
+
+        return self.build_map_payload_from_arrays(
+            positions,
+            colors,
+            color_valid_mask,
+            snapshot_frame_index,
+            max_points,
+        )
+
+    def build_map_payload_from_arrays(
+        self,
+        positions: np.ndarray,
+        colors: np.ndarray,
+        color_valid_mask: np.ndarray,
+        snapshot_frame_index: int,
+        max_points: int,
+    ) -> dict[str, Any] | None:
+        if max_points <= 0 or int(positions.shape[0]) <= 0:
+            return None
+
+        sampled_positions, sampled_colors, sampled_valid_mask = sample_cloud_prioritizing_valid(
+            positions,
+            colors,
+            color_valid_mask,
+            max_points,
+        )
+        sampled_colors, _ = neutralize_legacy_false_colors(
+            sampled_colors,
+            WEB_MAP_NEUTRAL_FALLBACK,
+            ~sampled_valid_mask,
+        )
+        snapshot_frame_index = max(0, min(snapshot_frame_index, len(self.frames) - 1))
+        snapshot_frame = self.frames[snapshot_frame_index]
+        return {
+            "frameIndex": snapshot_frame_index,
+            "frameId": "world",
+            "stampMs": int(round(float(snapshot_frame["stampSec"]) * 1000.0)),
+            "renderedPointCount": int(sampled_positions.shape[0]),
+            "sourcePointCount": int(positions.shape[0]),
+            "positions": np.round(sampled_positions.reshape(-1), 4).astype(float).tolist(),
+            "colors": sampled_colors.reshape(-1).astype(int).tolist(),
+        }
+
+    def refresh_overlay_live_map_payloads(self, frame_index: int) -> None:
+        payloads: dict[int, dict[str, Any]] = {}
+        for max_points in (3_000, 6_000):
+            payload = self.build_map_payload_from_voxels(
+                self.global_map_voxels,
+                frame_index,
+                max_points,
+            )
+            if payload is not None:
+                payloads[max_points] = payload
+        with self.lock:
+            self._overlay_live_map_payloads = payloads
+            self._overlay_map_cache_key = None
+            self._overlay_map_cache_payload = None
+
+    def schedule_refresh_overlay_live_map_payloads(self, frame_index: int) -> None:
+        with self._overlay_map_refresh_guard:
+            if self._overlay_map_refresh_busy:
+                self._overlay_map_refresh_pending_frame_index = int(frame_index)
+                return
+            self._overlay_map_refresh_busy = True
+            self._overlay_map_refresh_pending_frame_index = None
+
+        def run(next_frame_index: int) -> None:
+            try:
+                while True:
+                    voxel_values: list[MapVoxel] | None = None
+                    for _ in range(3):
+                        try:
+                            voxel_values = list(self.global_map_voxels.values())
+                            break
+                        except RuntimeError:
+                            time.sleep(0.002)
+                    if voxel_values is not None:
+                        payloads: dict[int, dict[str, Any]] = {}
+                        for max_points in (3_000, 6_000):
+                            payload = self.build_map_payload_from_voxel_values(
+                                voxel_values,
+                                next_frame_index,
+                                max_points,
+                            )
+                            if payload is not None:
+                                payloads[max_points] = payload
+                        with self.lock:
+                            self._overlay_live_map_payloads = payloads
+                            self._overlay_map_cache_key = None
+                            self._overlay_map_cache_payload = None
+
+                    with self._overlay_map_refresh_guard:
+                        pending = self._overlay_map_refresh_pending_frame_index
+                        if pending is None:
+                            self._overlay_map_refresh_busy = False
+                            return
+                        self._overlay_map_refresh_pending_frame_index = None
+                        next_frame_index = int(pending)
+            except Exception:
+                with self._overlay_map_refresh_guard:
+                    self._overlay_map_refresh_busy = False
+                raise
+
+        threading.Thread(
+            target=run,
+            args=(int(frame_index),),
+            daemon=True,
+            name="cached-overlay-map-refresh",
+        ).start()
+
+    def build_overlay_map_payload(
+        self,
+        requested_frame_index: int,
+        max_points: int,
+    ) -> dict[str, Any] | None:
+        resolved_index = self.resolve_frame_index(requested_frame_index)
+        if max_points <= 0 or resolved_index < 0 or resolved_index >= len(self.frames):
+            return None
+        with self.lock:
+            if self._overlay_map_cache_key == (resolved_index, max_points) and self._overlay_map_cache_payload is not None:
+                return dict(self._overlay_map_cache_payload)
+
+        keyframe_slot = bisect.bisect_right(self.keyframe_indices, resolved_index) - 1
+        if keyframe_slot < 0:
+            return None
+
+        restored_keyframe_index = self.keyframe_indices[keyframe_slot]
+        keyframe_positions, keyframe_colors, keyframe_valid_mask = load_clean_cloud_npz(
+            self.keyframe_files[keyframe_slot],
+            int(WEB_MAP_NEUTRAL_FALLBACK[0]),
+            int(WEB_MAP_NEUTRAL_FALLBACK[1]),
+            int(WEB_MAP_NEUTRAL_FALLBACK[2]),
+        )
+        frames_after_keyframe = max(0, resolved_index - restored_keyframe_index)
+        recent_fraction = min(0.45, 0.03 * float(frames_after_keyframe))
+        recent_budget = int(round(max_points * recent_fraction)) if frames_after_keyframe > 0 else 0
+        keyframe_budget = max(max_points - recent_budget, 1)
+        sampled_keyframe_positions, sampled_keyframe_colors, sampled_keyframe_valid_mask = (
+            sample_cloud_prioritizing_valid(
+                keyframe_positions,
+                keyframe_colors,
+                keyframe_valid_mask,
+                keyframe_budget,
+            )
+        )
+
+        merged_positions: list[np.ndarray] = [sampled_keyframe_positions]
+        merged_colors: list[np.ndarray] = [sampled_keyframe_colors]
+        merged_valid_masks: list[np.ndarray] = [sampled_keyframe_valid_mask]
+
+        fuse_cap = max(int(getattr(self.args, "map_fuse_max_points", 0) or 0), 1)
+        replay_indices = list(range(restored_keyframe_index + 1, resolved_index + 1))
+        if replay_indices and recent_budget > 0:
+            weights = np.array(
+                [0.28 + 0.72 * (0.62 ** (resolved_index - index)) for index in replay_indices],
+                dtype=np.float64,
+            )
+            weights /= max(float(weights.sum()), 1e-6)
+            allocations = np.maximum(1, np.floor(weights * recent_budget).astype(np.int32))
+            while int(allocations.sum()) < recent_budget:
+                allocations[np.argmax(weights)] += 1
+            while int(allocations.sum()) > recent_budget:
+                victim = int(np.argmax(allocations))
+                if allocations[victim] <= 1:
+                    break
+                allocations[victim] -= 1
+        else:
+            allocations = np.zeros((len(replay_indices),), dtype=np.int32)
+
+        for index, allocation in zip(replay_indices, allocations.tolist()):
+            if allocation <= 0:
+                continue
+            frame = self.frames[index]
+            positions, scan_colors, scan_valid_mask = load_clean_cloud_npz(
+                str((self.cache_dir / frame["scanFile"]).resolve()),
+                int(WEB_MAP_NEUTRAL_FALLBACK[0]),
+                int(WEB_MAP_NEUTRAL_FALLBACK[1]),
+                int(WEB_MAP_NEUTRAL_FALLBACK[2]),
+            )
+            positions_fuse, colors_fuse, colors_fuse_valid_mask = sample_cloud_prioritizing_valid(
+                positions,
+                scan_colors,
+                scan_valid_mask,
+                min(fuse_cap, allocation),
+            )
+            if positions_fuse.shape[0] <= 0:
+                continue
+            merged_positions.append(np.asarray(positions_fuse, dtype=np.float32, order="C"))
+            merged_colors.append(np.asarray(colors_fuse, dtype=np.uint8, order="C"))
+            merged_valid_masks.append(np.asarray(colors_fuse_valid_mask, dtype=bool))
+
+        payload = self.build_map_payload_from_arrays(
+            np.concatenate(merged_positions, axis=0),
+            np.concatenate(merged_colors, axis=0),
+            np.concatenate(merged_valid_masks, axis=0),
+            resolved_index,
+            max_points,
+        )
+        if payload is None:
+            return None
+
+        with self.lock:
+            self._overlay_map_cache_key = (resolved_index, max_points)
+            self._overlay_map_cache_payload = dict(payload)
+            return dict(payload)
+
+    def restore_map_from_keyframe(self, frame_index: int) -> int:
+        self.global_map_voxels = {}
+        keyframe_frame_index = self.restore_map_from_keyframe_into_voxels(
+            frame_index,
+            self.global_map_voxels,
+        )
+        self.global_map_point_count = len(self.global_map_voxels)
+        return keyframe_frame_index
+
+    def update_global_map_from_scan(
+        self,
+        positions: np.ndarray,
+        colors: np.ndarray,
+        stamp_sec: float,
+        color_valid_mask: np.ndarray | None = None,
+    ) -> None:
+        self.update_map_voxels_from_scan(
+            self.global_map_voxels,
+            positions,
+            colors,
+            stamp_sec,
+            color_valid_mask,
+        )
+        self.global_map_point_count = len(self.global_map_voxels)
 
     def compose_recent_scan_cloud(
         self,
@@ -1093,11 +1390,11 @@ class CachedPlaybackController:
         merged_colors: list[np.ndarray] = []
         for index, allocation in zip(indices, allocations.tolist()):
             frame = self.frames[index]
-            positions, colors = load_cloud_npz(str((self.cache_dir / frame["scanFile"]).resolve()))
-            reprojected_colors, valid_mask = self.reproject_colors_for_frame(
-                frame,
-                positions,
-                WEB_SCAN_NEUTRAL_FALLBACK,
+            positions, reprojected_colors, valid_mask = load_clean_cloud_npz(
+                str((self.cache_dir / frame["scanFile"]).resolve()),
+                int(WEB_SCAN_NEUTRAL_FALLBACK[0]),
+                int(WEB_SCAN_NEUTRAL_FALLBACK[1]),
+                int(WEB_SCAN_NEUTRAL_FALLBACK[2]),
             )
             sampled_positions, sampled_colors, sampled_valid_mask = sample_cloud_prioritizing_valid(
                 positions,
@@ -1250,11 +1547,11 @@ class CachedPlaybackController:
 
         for index in range(start_index, frame_index + 1):
             frame = self.frames[index]
-            positions, colors = load_cloud_npz(str((self.cache_dir / frame["scanFile"]).resolve()))
-            colors_reprojected, colors_valid_mask = self.reproject_colors_for_frame(
-                frame,
-                positions,
-                WEB_MAP_NEUTRAL_FALLBACK,
+            positions, colors_reprojected, colors_valid_mask = load_clean_cloud_npz(
+                str((self.cache_dir / frame["scanFile"]).resolve()),
+                int(WEB_MAP_NEUTRAL_FALLBACK[0]),
+                int(WEB_MAP_NEUTRAL_FALLBACK[1]),
+                int(WEB_MAP_NEUTRAL_FALLBACK[2]),
             )
             positions_fuse, colors_fuse, colors_fuse_valid_mask = sample_cloud_prioritizing_valid(
                 positions,
@@ -1367,10 +1664,11 @@ class CachedPlaybackController:
             next_frame = self.frames[next_index]
             positions, colors = load_cloud_npz(str((self.cache_dir / next_frame["scanFile"]).resolve()))
             fuse_cap = int(getattr(self.args, "map_fuse_max_points", 0) or 0)
-            colors_reprojected, colors_valid_mask = self.reproject_colors_for_frame(
-                next_frame,
-                positions,
-                WEB_MAP_NEUTRAL_FALLBACK,
+            _, colors_reprojected, colors_valid_mask = load_clean_cloud_npz(
+                str((self.cache_dir / next_frame["scanFile"]).resolve()),
+                int(WEB_MAP_NEUTRAL_FALLBACK[0]),
+                int(WEB_MAP_NEUTRAL_FALLBACK[1]),
+                int(WEB_MAP_NEUTRAL_FALLBACK[2]),
             )
             positions_fuse, colors_fuse, colors_fuse_valid_mask = sample_cloud_prioritizing_valid(
                 positions,
@@ -1458,12 +1756,14 @@ class Handler(BaseHTTPRequestHandler):
             trajectory_tail_sec_raw = query.get("trajectoryTailSec", ["0"])[0] or "0"
             scan_max_points_raw = query.get("scanMaxPoints", ["1600"])[0] or "1600"
             scan_history_frames_raw = query.get("scanHistoryFrames", ["0"])[0] or "0"
+            map_max_points_raw = query.get("mapMaxPoints", ["0"])[0] or "0"
             try:
                 frame_index = int(frame_index_raw) if frame_index_raw is not None else None
                 trajectory_max_points = int(trajectory_max_points_raw)
                 trajectory_tail_sec = float(trajectory_tail_sec_raw)
                 scan_max_points = int(scan_max_points_raw)
                 scan_history_frames = int(scan_history_frames_raw)
+                map_max_points = int(map_max_points_raw)
             except ValueError:
                 self.respond_json({"error": "Invalid overlay query."}, HTTPStatus.BAD_REQUEST)
                 return
@@ -1474,13 +1774,14 @@ class Handler(BaseHTTPRequestHandler):
                     trajectory_tail_sec=trajectory_tail_sec,
                     scan_max_points=scan_max_points,
                     scan_history_frames=scan_history_frames if scan_history_frames > 0 else None,
+                    map_max_points=map_max_points,
                 )
             )
             return
         if parsed.path == "/video_sync":
             query = parse_qs(parsed.query)
             fps = float(query.get("fps", ["12"])[0] or "12")
-            speed = float(query.get("speed", ["8"])[0] or "8")
+            speed = float(query.get("speed", ["1"])[0] or "1")
             start_offset_sec = float(query.get("startOffsetSec", ["0"])[0] or "0")
             end_offset_sec = float(query.get("endOffsetSec", ["-1"])[0] or "-1")
             self.respond_json(

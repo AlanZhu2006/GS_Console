@@ -556,6 +556,23 @@ input {
   pointer-events: auto;
 }
 
+.viewer-error-overlay {
+  position: absolute;
+  left: 50%;
+  bottom: 1.2rem;
+  transform: translateX(-50%);
+  z-index: 4;
+  max-width: min(42rem, calc(100% - 2rem));
+  padding: 0.85rem 1rem;
+  border-radius: 0.85rem;
+  border: 1px solid rgba(212, 146, 74, 0.42);
+  background: rgba(17, 19, 24, 0.92);
+  color: #f0d5b4;
+  font-size: 0.95rem;
+  line-height: 1.4;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+}
+
 .overlay-card {
   max-width: 18rem;
   padding: 0.72rem 0.82rem;

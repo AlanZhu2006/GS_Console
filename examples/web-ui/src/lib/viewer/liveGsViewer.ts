@@ -158,11 +158,7 @@ export class LiveGsViewer {
   private readonly mouseMoveHandler = (event: MouseEvent) => this.handlePointerLook(event);
 
   constructor(private readonly canvas: HTMLCanvasElement) {
-    this.renderer = new THREE.WebGLRenderer({
-      canvas,
-      antialias: false,
-      alpha: false
-    });
+    this.renderer = createWebGlRenderer(canvas);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
 
     this.scene.background = new THREE.Color("#111318");
@@ -1089,7 +1085,13 @@ export class LiveGsViewer {
     const bounds = geometry.boundingBox ?? new THREE.Box3().setFromObject(object);
     this.meshBounds = bounds;
     if (isFiniteBox(bounds)) {
-      this.frameLiveScene();
+      if (this.mode === "gs") {
+        this.frameGsScene();
+      } else if (this.mode === "playback") {
+        this.framePlaybackScene();
+      } else {
+        this.frameLiveScene();
+      }
     }
     this.meshUrl = url;
   }
@@ -1117,7 +1119,13 @@ export class LiveGsViewer {
     const bounds = geometry.boundingBox ?? new THREE.Box3().setFromObject(object);
     this.rawPointCloudBounds = bounds;
     if (isFiniteBox(bounds)) {
-      this.frameLiveScene();
+      if (this.mode === "gs") {
+        this.frameGsScene();
+      } else if (this.mode === "playback") {
+        this.framePlaybackScene();
+      } else {
+        this.frameLiveScene();
+      }
     }
     this.rawPointCloudUrl = url;
   }
@@ -2204,6 +2212,54 @@ function disposeObject(object: THREE.Object3D): void {
         material.dispose();
       }
     }
+  });
+}
+
+function createWebGlRenderer(canvas: HTMLCanvasElement): THREE.WebGLRenderer {
+  const contextAttributes: WebGLContextAttributes = {
+    alpha: false,
+    antialias: false,
+    depth: true,
+    stencil: false,
+    premultipliedAlpha: false,
+    preserveDrawingBuffer: false,
+    failIfMajorPerformanceCaveat: false,
+    powerPreference: "high-performance"
+  };
+
+  const contextNames: Array<"webgl2" | "webgl" | "experimental-webgl"> = [
+    "webgl2",
+    "webgl",
+    "experimental-webgl"
+  ];
+
+  let context: WebGLRenderingContext | WebGL2RenderingContext | null = null;
+  for (const contextName of contextNames) {
+    try {
+      context = canvas.getContext(
+        contextName,
+        contextAttributes
+      ) as WebGLRenderingContext | WebGL2RenderingContext | null;
+    } catch {
+      context = null;
+    }
+    if (context) {
+      break;
+    }
+  }
+
+  if (!context) {
+    throw new Error(
+      "WebGL is unavailable in this browser session. Enable hardware acceleration or use a browser/device with WebGL support."
+    );
+  }
+
+  return new THREE.WebGLRenderer({
+    canvas,
+    context,
+    antialias: false,
+    alpha: false,
+    powerPreference: "high-performance"
   });
 }
 

@@ -111,6 +111,7 @@ export default function TopDownMap(props: TopDownMapProps) {
   }>({ cloud: null, manifest: null, meta: null });
   const playbackGridRafRef = useRef(0);
   const playbackGridLastBuildRef = useRef(0);
+  const playbackGridLastStampRef = useRef<number | null>(null);
   const drawModelRef = useRef<{
     effectiveGrid: OccupancyGrid | null;
     rasterCanvas: HTMLCanvasElement | null;
@@ -167,15 +168,24 @@ export default function TopDownMap(props: TopDownMapProps) {
           if (!cloud || !meta || !manifest) {
             return;
           }
+          const nextStampMs = cloud.stampMs ?? null;
+          if (nextStampMs !== null && playbackGridLastStampRef.current === nextStampMs) {
+            return;
+          }
           const now = performance.now();
           if (
             playbackGridLastBuildRef.current > 0 &&
-            now - playbackGridLastBuildRef.current < 16
+            now - playbackGridLastBuildRef.current < 45
           ) {
             return;
           }
           playbackGridLastBuildRef.current = now;
-          const nextGrid = projectLiveCloudToGrid(cloud, manifest, meta);
+          playbackGridLastStampRef.current = nextStampMs;
+          const nextGrid = projectLiveCloudToGrid(
+            sampleDecodedCloudForGrid(cloud, 24_000),
+            manifest,
+            meta
+          );
           setBaseGrid(nextGrid);
           const c = canvasRef.current;
           if (
@@ -194,7 +204,11 @@ export default function TopDownMap(props: TopDownMapProps) {
           }
         };
       }
-      const nextGrid = projectLiveCloudToGrid(useStreamingMapCloud, props.manifest, streamingMapMeta);
+      const nextGrid = projectLiveCloudToGrid(
+        sampleDecodedCloudForGrid(useStreamingMapCloud, 36_000),
+        props.manifest,
+        streamingMapMeta
+      );
       setBaseGrid(nextGrid);
       const c = canvasRef.current;
       if (
@@ -210,6 +224,7 @@ export default function TopDownMap(props: TopDownMapProps) {
 
     playbackViewportFitRef.current = false;
     playbackStreamRefitPendingRef.current = true;
+    playbackGridLastStampRef.current = null;
 
     if (!props.manifest?.occupancy || !mapMeta) {
       setBaseGrid(null);
@@ -766,6 +781,44 @@ function projectLiveCloudToGrid(
 
   dilateOccupiedCellsLocal(grid, manifest?.robot?.radius ?? 0.28);
   return grid;
+}
+
+function sampleDecodedCloudForGrid(
+  cloud: DecodedPointCloud,
+  maxPoints: number
+): DecodedPointCloud {
+  const limit = Math.max(1, maxPoints);
+  if (cloud.renderedPointCount <= limit) {
+    return cloud;
+  }
+
+  const stride = Math.max(1, Math.ceil(cloud.renderedPointCount / limit));
+  const kept = Math.min(limit, Math.ceil(cloud.renderedPointCount / stride));
+  const positions = new Float32Array(kept * 3);
+  const colors = cloud.colors ? new Float32Array(kept * 3) : undefined;
+  let writeIndex = 0;
+
+  for (let index = 0; index < cloud.renderedPointCount && writeIndex < kept; index += stride) {
+    const readOffset = index * 3;
+    const writeOffset = writeIndex * 3;
+    positions[writeOffset] = cloud.positions[readOffset];
+    positions[writeOffset + 1] = cloud.positions[readOffset + 1];
+    positions[writeOffset + 2] = cloud.positions[readOffset + 2];
+    if (colors && cloud.colors) {
+      colors[writeOffset] = cloud.colors[readOffset];
+      colors[writeOffset + 1] = cloud.colors[readOffset + 1];
+      colors[writeOffset + 2] = cloud.colors[readOffset + 2];
+    }
+    writeIndex += 1;
+  }
+
+  return {
+    ...cloud,
+    sourcePointCount: writeIndex,
+    renderedPointCount: writeIndex,
+    positions: positions.subarray(0, writeIndex * 3),
+    colors: colors ? colors.subarray(0, writeIndex * 3) : undefined
+  };
 }
 
 function buildMapMetaFromPointCloud(cloud: DecodedPointCloud, manifest: SceneManifest | null): OccupancyMapMeta | null {

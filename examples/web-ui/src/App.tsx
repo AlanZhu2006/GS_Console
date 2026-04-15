@@ -100,8 +100,14 @@ interface PlaybackStatus {
   bagStartSec: number;
   bagEndSec: number;
   playbackAlive?: boolean;
+  latestImageStampSec?: number | null;
+  latestPoseStampSec?: number | null;
+  globalMapPoints?: number;
+  currentScanPoints?: number;
   frameIndex?: number;
   frameCount?: number;
+  keyframeCount?: number;
+  cacheDir?: string;
   currentPose?: Pose3D | null;
   video?: PlaybackVideoDescriptor | null;
   mode?: string;
@@ -142,6 +148,7 @@ interface PlaybackOverlayState {
   frameIndex: number;
   trajectory: Pose3D[];
   scan: PlaybackOverlayScanPayload | null;
+  map?: PlaybackOverlayScanPayload | null;
 }
 
 interface PlaybackPoseTrack {
@@ -279,6 +286,7 @@ export default function App() {
   const [playbackVideoReady, setPlaybackVideoReady] = useState(false);
   const [playbackVideoDurationSec, setPlaybackVideoDurationSec] = useState(0);
   const [playbackVideoCurrentTimeSec, setPlaybackVideoCurrentTimeSec] = useState(0);
+  const [playbackVideoPresentedTimeSec, setPlaybackVideoPresentedTimeSec] = useState<number | null>(null);
   const [playbackVideoSyncFrameIndex, setPlaybackVideoSyncFrameIndex] = useState<number | null>(null);
   const [playbackVideoPaused, setPlaybackVideoPaused] = useState(true);
   const [playbackVideoRate, setPlaybackVideoRate] = useState(1);
@@ -325,10 +333,13 @@ export default function App() {
   const playbackVideoLastFrameSyncRef = useRef<number | null>(null);
   const playbackVideoLastSyncWallRef = useRef(0);
   const playbackVideoLastSeekWallRef = useRef(0);
+  const playbackVideoInitializingRef = useRef(false);
   const playbackOverlayAbortRef = useRef<AbortController | null>(null);
   const playbackOverlayFetchInFlightRef = useRef(false);
   const playbackOverlayDesiredRef = useRef<{ frameIndex: number; tailSec: number } | null>(null);
   const playbackOverlayLoadedKeyRef = useRef<string | null>(null);
+  const playbackOverlayLastRequestedFrameRef = useRef<number | null>(null);
+  const playbackOverlayLastRequestWallRef = useRef(0);
   const playbackOverlayAccumulationRef = useRef<PlaybackLocalMapState>({
     voxels: new Map(),
     order: [],
@@ -336,6 +347,7 @@ export default function App() {
   });
   const sceneManifestSignatureRef = useRef<string | null>(null);
   const playbackVideoCurrentTimeStateRef = useRef(0);
+  const playbackVideoPresentedTimeStateRef = useRef<number | null>(null);
   const playbackVideoPausedStateRef = useRef(true);
   const playbackVideoRateStateRef = useRef(1);
   const playbackVideoDraftTimeStateRef = useRef<number | null>(null);
@@ -344,14 +356,26 @@ export default function App() {
     setMainCanvasNode(node);
   }, []);
   const viewerRef = useRef<LiveGsViewer | null>(null);
+  const [playbackResolvedMapPointCloud, setPlaybackResolvedMapPointCloud] =
+    useState<DecodedPointCloud | null>(null);
 
   useEffect(() => {
     playbackStatusRef.current = playbackStatus;
   }, [playbackStatus]);
 
+  const commitPlaybackStatus = useCallback((nextStatus: PlaybackStatus) => {
+    setPlaybackStatus((current) =>
+      arePlaybackStatusesEquivalent(current, nextStatus) ? current : nextStatus
+    );
+  }, []);
+
   useEffect(() => {
     playbackVideoCurrentTimeStateRef.current = playbackVideoCurrentTimeSec;
   }, [playbackVideoCurrentTimeSec]);
+
+  useEffect(() => {
+    playbackVideoPresentedTimeStateRef.current = playbackVideoPresentedTimeSec;
+  }, [playbackVideoPresentedTimeSec]);
 
   useEffect(() => {
     playbackVideoPausedStateRef.current = playbackVideoPaused;
@@ -371,6 +395,7 @@ export default function App() {
       setPlaybackVideoReady(false);
       setPlaybackVideoDurationSec(0);
       setPlaybackVideoCurrentTimeSec(0);
+      setPlaybackVideoPresentedTimeSec(null);
       setPlaybackVideoPaused(true);
       setPlaybackVideoRate(1);
       return;
@@ -431,7 +456,8 @@ export default function App() {
         }
         node.playbackRate = carryover.playbackRate;
         refreshPlaybackVideoState();
-        if (carryover.paused) {
+        const shouldRemainPaused = playbackStatusRef.current?.paused ?? carryover.paused;
+        if (shouldRemainPaused) {
           node.pause();
         } else {
           void node.play().catch(() => {
@@ -602,6 +628,8 @@ export default function App() {
       : consoleMode === "playback"
         ? "playback"
         : "live";
+  const hifiNativeRendererReady = Boolean(hifiWindowStatus?.ready || hifiStatus?.ready);
+  const hifiBrowserFallbackActive = consoleMode === "hifi" && !hifiNativeRendererReady;
   const modeLabel =
     consoleMode === "compare"
       ? "Compare Review"
@@ -614,7 +642,9 @@ export default function App() {
           : "Live Mapping";
   const mainViewSource =
     consoleMode === "hifi"
-      ? "Native render"
+      ? hifiBrowserFallbackActive
+        ? "Browser GS fallback"
+        : "Native render"
       : consoleMode === "playback"
       ? [
           layers.gaussian ? "Gaussian" : null,
@@ -637,7 +667,8 @@ export default function App() {
     consoleMode,
     viewerMode,
     occupancyCloudAssetState,
-    rosState.streamProfile
+    rosState.streamProfile,
+    hifiBrowserFallbackActive
   );
   const dataSemantic = describeDataSemantic(
     rosState.connectionState,
@@ -649,7 +680,8 @@ export default function App() {
     consoleMode,
     viewerMode,
     activeGaussianVariant,
-    gsControlMode
+    gsControlMode,
+    hifiBrowserFallbackActive
   );
   const playbackVideoDescriptor = useMemo<PlaybackVideoDescriptor | null>(
     () => playbackStatus?.video ?? null,
@@ -677,7 +709,8 @@ export default function App() {
     () => computePlaybackVideoToBagScale(playbackVideoDurationSec, playbackStatus?.durationSec ?? 0),
     [playbackStatus?.durationSec, playbackVideoDurationSec]
   );
-  const effectivePlaybackVideoTimeSec = playbackVideoDraftTimeSec ?? playbackVideoCurrentTimeSec;
+  const effectivePlaybackVideoTimeSec =
+    playbackVideoDraftTimeSec ?? playbackVideoPresentedTimeSec ?? playbackVideoCurrentTimeSec;
   const effectivePlaybackOffset = videoTimeToPlaybackOffsetSec(
     effectivePlaybackVideoTimeSec,
     playbackVideoDurationSec,
@@ -685,13 +718,15 @@ export default function App() {
     playbackVideoSyncMap
   );
   const playbackVisualVideoFrameIndex = playbackVideoSyncFrameIndex ?? null;
-  const playbackVisualPlaybackFrameIndex =
+  const playbackVideoDerivedPlaybackFrameIndex =
     playbackVideoSyncMap &&
     playbackVisualVideoFrameIndex !== null &&
     playbackVisualVideoFrameIndex >= 0 &&
     playbackVisualVideoFrameIndex < playbackVideoSyncMap.frameIndices.length
       ? playbackVideoSyncMap.frameIndices[playbackVisualVideoFrameIndex] ?? null
-      : playbackStatus?.frameIndex ?? null;
+      : null;
+  const playbackVisualPlaybackFrameIndex =
+    playbackStatus?.frameIndex ?? playbackVideoDerivedPlaybackFrameIndex ?? null;
   const playbackPoseTrackPose =
     playbackPoseTrack &&
     playbackVisualPlaybackFrameIndex !== null &&
@@ -701,41 +736,89 @@ export default function App() {
       : null;
   const playbackTargetStampMs =
     consoleMode === "playback"
-      ? playbackPoseTrackPose?.stampMs ?? playbackStatus?.currentPose?.stampMs ?? null
+      ? playbackStatus?.currentPose?.stampMs ?? playbackPoseTrackPose?.stampMs ?? null
       : null;
   const playbackOverlayScan = playbackOverlayScanPointCloud ?? rosState.playbackScanPointCloud;
-  const playbackTrajectorySource =
-    consoleMode === "playback" && playbackPoseTrack && playbackVisualPlaybackFrameIndex !== null
-      ? buildPlaybackTrajectoryFromPoseTrack(
-          playbackPoseTrack.poses,
-          playbackVisualPlaybackFrameIndex,
-          playbackShowcase ? 1024 : 640
-        )
-      : playbackOverlayTrajectory ?? rosState.trajectory;
+  const playbackTrajectorySource = useMemo(
+    () =>
+      consoleMode === "playback" && playbackPoseTrack && playbackVisualPlaybackFrameIndex !== null
+        ? buildPlaybackTrajectoryFromPoseTrack(
+            playbackPoseTrack.poses,
+            playbackVisualPlaybackFrameIndex,
+            playbackShowcase ? 4096 : 3072
+          )
+        : playbackOverlayTrajectory ?? rosState.trajectory,
+    [
+      consoleMode,
+      playbackOverlayTrajectory,
+      playbackPoseTrack,
+      playbackShowcase,
+      playbackVisualPlaybackFrameIndex,
+      rosState.trajectory
+    ]
+  );
   const playbackOverlayRobotPose = playbackOverlayTrajectory?.at(-1) ?? null;
+  useEffect(() => {
+    if (consoleMode !== "playback") {
+      setPlaybackResolvedMapPointCloud(null);
+      return;
+    }
+
+    const nextMap =
+      playbackOverlayAccumulatedPointCloud ??
+      rosState.playbackAccumulatedPointCloud ??
+      null;
+    if (!nextMap || nextMap.renderedPointCount < 1) {
+      return;
+    }
+    setPlaybackResolvedMapPointCloud(nextMap);
+  }, [
+    consoleMode,
+    playbackOverlayAccumulatedPointCloud,
+    rosState.playbackAccumulatedPointCloud
+  ]);
   const hasLiveCloud = Boolean(
     rosState.livePointCloud ||
-      rosState.playbackAccumulatedPointCloud ||
+      playbackResolvedMapPointCloud ||
       playbackOverlayScan
   );
   const activeMapPointCloud =
     consoleMode === "playback"
-      ? rosState.playbackAccumulatedPointCloud ??
+      ? playbackResolvedMapPointCloud ??
         playbackOverlayScan ??
         rosState.playbackScanPointCloud ??
         rosState.livePointCloud
       : rosState.livePointCloud;
-  const playbackTopDownMapPointCloud =
-    consoleMode === "playback"
-      ? playbackOverlayAccumulatedPointCloud ??
-        rosState.playbackAccumulatedPointCloud ??
-        playbackOverlayScan ??
-        rosState.playbackScanPointCloud ??
-        rosState.livePointCloud
-      : activeMapPointCloud;
+  const playbackTopDownMapPointCloud = useMemo(
+    () =>
+      consoleMode === "playback"
+        ? pickPlaybackAccumulatedMapPointCloudForTarget(
+            playbackTargetStampMs,
+            playbackResolvedMapPointCloud,
+            playbackOverlayAccumulatedPointCloud,
+            playbackOverlayScan,
+            rosState.playbackScanPointCloud,
+            rosState.livePointCloud
+          )
+        : activeMapPointCloud,
+    [
+      activeMapPointCloud,
+      consoleMode,
+      playbackOverlayAccumulatedPointCloud,
+      playbackOverlayScan,
+      playbackResolvedMapPointCloud,
+      playbackTargetStampMs,
+      rosState.livePointCloud,
+      rosState.playbackScanPointCloud
+    ]
+  );
   const playbackRobotPose =
     consoleMode === "playback"
-      ? playbackPoseTrackPose ?? rosState.robotPose ?? playbackStatus?.currentPose ?? playbackOverlayRobotPose ?? null
+      ? playbackStatus?.currentPose ??
+        playbackPoseTrackPose ??
+        rosState.robotPose ??
+        playbackOverlayRobotPose ??
+        null
       : null;
   const playbackDisplayTrajectory = useMemo(() => {
     if (consoleMode !== "playback") {
@@ -844,14 +927,13 @@ export default function App() {
     if (!playbackGsComparePose) {
       return "Waiting for pose.";
     }
-    if (!(hifiWindowStatus?.ready || hifiStatus?.ready)) {
+    if (!hifiNativeRendererReady) {
       return "HiFi GS renderer offline.";
     }
     return "HiFi MJPEG — pose pushed over HTTP; expect extra latency vs Playback RGB.";
   }, [
     playbackCompareMode,
-    hifiStatus?.ready,
-    hifiWindowStatus?.ready,
+    hifiNativeRendererReady,
     playbackGsComparePose,
     playbackStatus
   ]);
@@ -954,7 +1036,7 @@ export default function App() {
               if (candidate !== playbackApiUrl) {
                 setPlaybackApiUrl(candidate);
               }
-              setPlaybackStatus(status);
+              commitPlaybackStatus(status);
               setPlaybackError(null);
             }
             return;
@@ -978,7 +1060,7 @@ export default function App() {
     }, 2000);
 
     void loadStatus();
-    const intervalId = window.setInterval(loadStatus, 180);
+    const intervalId = window.setInterval(loadStatus, 120);
     return () => {
       disposed = true;
       window.clearTimeout(warmupTimerId);
@@ -993,10 +1075,14 @@ export default function App() {
     playbackVideoLastSyncSignatureRef.current = null;
     playbackVideoLastFrameSyncRef.current = null;
     playbackVideoLastSyncWallRef.current = 0;
+    playbackVideoInitializingRef.current = false;
     setPlaybackVideoDraftTimeSec(null);
+    setPlaybackVideoPresentedTimeSec(null);
     setPlaybackVideoSyncFrameIndex(null);
     playbackOverlayDesiredRef.current = null;
     playbackOverlayLoadedKeyRef.current = null;
+    playbackOverlayLastRequestedFrameRef.current = null;
+    playbackOverlayLastRequestWallRef.current = 0;
     playbackOverlayFetchInFlightRef.current = false;
     playbackOverlayAbortRef.current?.abort();
     playbackOverlayAbortRef.current = null;
@@ -1009,6 +1095,7 @@ export default function App() {
       lastFrameIndex: null
     };
     setPlaybackOverlayAccumulatedPointCloud(null);
+    setPlaybackResolvedMapPointCloud(null);
     setPlaybackError(null);
     refreshPlaybackVideoState();
   }, [playbackVideoSourceUrl, refreshPlaybackVideoState]);
@@ -1131,14 +1218,16 @@ export default function App() {
       const candidates = buildControlUrlCandidates(playbackApiUrl, "/__playback_control", 8765);
       for (const candidate of candidates) {
         try {
-          const overlayScanMaxPoints = playbackShowcase ? "6000" : "4200";
-          const overlayScanHistoryFrames = playbackShowcase ? "4" : "3";
+          const overlayScanMaxPoints = playbackShowcase ? "9000" : "7200";
+          const overlayScanHistoryFrames = playbackShowcase ? "2" : "1";
+          const overlayMapMaxPoints = playbackShowcase ? "6000" : "3000";
           const query = new URLSearchParams({
             frameIndex: String(desired.frameIndex),
             trajectoryMaxPoints: "1",
             trajectoryTailSec: "0",
             scanMaxPoints: overlayScanMaxPoints,
-            scanHistoryFrames: overlayScanHistoryFrames
+            scanHistoryFrames: overlayScanHistoryFrames,
+            mapMaxPoints: overlayMapMaxPoints
           });
           const response = await fetch(`${candidate}/overlay.json?${query.toString()}`, {
             cache: "no-store",
@@ -1157,6 +1246,9 @@ export default function App() {
           }
           setPlaybackOverlayTrajectory(payload.trajectory ?? []);
           setPlaybackOverlayScanPointCloud(decodePlaybackOverlayScan(payload.scan));
+          setPlaybackOverlayAccumulatedPointCloud(
+            payload.map ? decodePlaybackOverlayScan(payload.map) : null
+          );
           setPlaybackOverlayFrameIndex(payload.frameIndex ?? desired.frameIndex);
           playbackOverlayLoadedKeyRef.current = desiredKey;
           loaded = true;
@@ -1192,6 +1284,8 @@ export default function App() {
     if (consoleMode !== "playback") {
       playbackOverlayDesiredRef.current = null;
       playbackOverlayLoadedKeyRef.current = null;
+      playbackOverlayLastRequestedFrameRef.current = null;
+      playbackOverlayLastRequestWallRef.current = 0;
       playbackOverlayFetchInFlightRef.current = false;
       playbackOverlayAbortRef.current?.abort();
       playbackOverlayAbortRef.current = null;
@@ -1206,45 +1300,38 @@ export default function App() {
       return;
     }
 
+    const now = performance.now();
+    const lastRequestedFrame = playbackOverlayLastRequestedFrameRef.current;
+    const lastRequestedWall = playbackOverlayLastRequestWallRef.current;
+    const minFrameDelta = playbackShowcase ? 2 : 1;
+    const minRequestGapMs = playbackShowcase ? 95 : 120;
+    const playing = !playbackVideoPausedStateRef.current;
+    if (
+      playing &&
+      lastRequestedFrame !== null &&
+      frameIndex >= lastRequestedFrame &&
+      frameIndex - lastRequestedFrame < minFrameDelta &&
+      now - lastRequestedWall < minRequestGapMs
+    ) {
+      return;
+    }
+
+    playbackOverlayLastRequestedFrameRef.current = frameIndex;
+    playbackOverlayLastRequestWallRef.current = now;
     playbackOverlayDesiredRef.current = {
       frameIndex,
       tailSec: 0
     };
     void pumpPlaybackOverlay();
-  }, [consoleMode, playbackVisualPlaybackFrameIndex, pumpPlaybackOverlay]);
-
-  useEffect(() => {
-    if (consoleMode !== "playback" || !playbackOverlayScan || playbackOverlayFrameIndex === null) {
-      return;
-    }
-
-    const state = playbackOverlayAccumulationRef.current;
-    if (state.lastFrameIndex !== null && playbackOverlayFrameIndex < state.lastFrameIndex) {
-      playbackOverlayAccumulationRef.current = {
-        voxels: new Map(),
-        order: [],
-        lastFrameIndex: null
-      };
-      setPlaybackOverlayAccumulatedPointCloud(null);
-    }
-
-    const nextState = playbackOverlayAccumulationRef.current;
-    const nextCloud = accumulatePlaybackOverlayMap(
-      nextState,
-      playbackOverlayScan,
-      playbackOverlayFrameIndex,
-      playbackShowcase ? 220_000 : 150_000,
-      playbackShowcase ? 0.14 : 0.18
-    );
-    playbackOverlayAccumulationRef.current = nextState;
-    setPlaybackOverlayAccumulatedPointCloud(nextCloud);
-  }, [consoleMode, playbackOverlayFrameIndex, playbackOverlayScan, playbackShowcase]);
+  }, [consoleMode, playbackShowcase, playbackVisualPlaybackFrameIndex, pumpPlaybackOverlay]);
 
   useEffect(() => {
     playbackVideoLastSyncSignatureRef.current = null;
     playbackVideoLastFrameSyncRef.current = null;
     playbackVideoLastSyncWallRef.current = 0;
     playbackVideoLastSeekWallRef.current = 0;
+    playbackOverlayLastRequestedFrameRef.current = null;
+    playbackOverlayLastRequestWallRef.current = 0;
   }, [playbackVideoSyncMap]);
 
   useEffect(() => {
@@ -1277,11 +1364,26 @@ export default function App() {
       }
     };
 
-    const updateFrameIndex = () => {
+    const updateFrameIndex = (timeSec?: number) => {
       if (disposed) {
         return;
       }
-      const nextFrameIndex = resolvePlaybackFrameIndexFromVideoTime(video.currentTime, playbackVideoSyncMap);
+      const durationSec = Number.isFinite(video.duration) ? Math.max(video.duration, 0) : 0;
+      const resolvedTimeSec =
+        typeof timeSec === "number" && Number.isFinite(timeSec)
+          ? Math.max(0, timeSec)
+          : Math.max(0, video.currentTime || 0);
+      const clampedPresentedTimeSec =
+        video.ended && durationSec > 0 ? durationSec : resolvedTimeSec;
+      setPlaybackVideoPresentedTimeSec((current) =>
+        current !== null && Math.abs(current - clampedPresentedTimeSec) <= 1e-3
+          ? current
+          : clampedPresentedTimeSec
+      );
+      const nextFrameIndex =
+        video.ended && playbackVideoSyncMap?.videoFrameCount
+          ? Math.max(playbackVideoSyncMap.videoFrameCount - 1, 0)
+          : resolvePlaybackFrameIndexFromVideoTime(clampedPresentedTimeSec, playbackVideoSyncMap);
       setPlaybackVideoSyncFrameIndex((current) =>
         current === nextFrameIndex ? current : nextFrameIndex
       );
@@ -1295,10 +1397,12 @@ export default function App() {
       }
       if ("requestVideoFrameCallback" in video) {
         const frameVideo = video as HTMLVideoElement & {
-          requestVideoFrameCallback(callback: () => void): number;
+          requestVideoFrameCallback(
+            callback: (now: number, metadata: { mediaTime?: number }) => void
+          ): number;
         };
-        const tick = () => {
-          updateFrameIndex();
+        const tick = (_now: number, metadata: { mediaTime?: number }) => {
+          updateFrameIndex(metadata?.mediaTime);
           callbackId = frameVideo.requestVideoFrameCallback(tick);
         };
         callbackId = frameVideo.requestVideoFrameCallback(tick);
@@ -1323,6 +1427,7 @@ export default function App() {
     video.addEventListener("play", startLoop);
     video.addEventListener("pause", handlePassiveUpdate);
     video.addEventListener("ratechange", handlePassiveUpdate);
+    video.addEventListener("ended", handlePassiveUpdate);
 
     return () => {
       disposed = true;
@@ -1334,6 +1439,7 @@ export default function App() {
       video.removeEventListener("play", startLoop);
       video.removeEventListener("pause", handlePassiveUpdate);
       video.removeEventListener("ratechange", handlePassiveUpdate);
+      video.removeEventListener("ended", handlePassiveUpdate);
     };
   }, [consoleMode, playbackVideoElement, playbackVideoReady, playbackVideoSyncMap]);
 
@@ -1437,7 +1543,7 @@ export default function App() {
             if (candidate !== playbackApiUrl) {
               setPlaybackApiUrl(candidate);
             }
-            setPlaybackStatus(status);
+            commitPlaybackStatus(status);
             setPlaybackVideoDraftTimeSec(null);
             setPlaybackError(null);
             return true;
@@ -1597,6 +1703,8 @@ export default function App() {
     pausePlaybackVideo();
     playbackOverlayDesiredRef.current = null;
     playbackOverlayLoadedKeyRef.current = null;
+    playbackOverlayLastRequestedFrameRef.current = null;
+    playbackOverlayLastRequestWallRef.current = 0;
     playbackOverlayFetchInFlightRef.current = false;
     playbackOverlayAbortRef.current?.abort();
     playbackOverlayAbortRef.current = null;
@@ -1629,6 +1737,8 @@ export default function App() {
       if (video.ended || video.currentTime >= Math.max(video.duration - 0.05, 0)) {
         playbackOverlayDesiredRef.current = null;
         playbackOverlayLoadedKeyRef.current = null;
+        playbackOverlayLastRequestedFrameRef.current = null;
+        playbackOverlayLastRequestWallRef.current = 0;
         playbackOverlayFetchInFlightRef.current = false;
         playbackOverlayAbortRef.current?.abort();
         playbackOverlayAbortRef.current = null;
@@ -1641,6 +1751,7 @@ export default function App() {
           lastFrameIndex: null
         };
         setPlaybackOverlayAccumulatedPointCloud(null);
+        setPlaybackResolvedMapPointCloud(null);
         await seekPlaybackVideo(0);
       }
       const started = await requestPlaybackVideoPlay();
@@ -1664,6 +1775,8 @@ export default function App() {
     pausePlaybackVideo();
     playbackOverlayDesiredRef.current = null;
     playbackOverlayLoadedKeyRef.current = null;
+    playbackOverlayLastRequestedFrameRef.current = null;
+    playbackOverlayLastRequestWallRef.current = 0;
     playbackOverlayFetchInFlightRef.current = false;
     playbackOverlayAbortRef.current?.abort();
     playbackOverlayAbortRef.current = null;
@@ -1676,6 +1789,7 @@ export default function App() {
       lastFrameIndex: null
     };
     setPlaybackOverlayAccumulatedPointCloud(null);
+    setPlaybackResolvedMapPointCloud(null);
     await seekPlaybackVideo(0);
     setPlaybackVideoDraftTimeSec(null);
     await syncPlaybackToMasterVideo(true);
@@ -1715,8 +1829,11 @@ export default function App() {
     playbackVideoLastFrameSyncRef.current = null;
     playbackVideoLastSyncWallRef.current = 0;
     playbackVideoLastSeekWallRef.current = 0;
+    playbackVideoInitializingRef.current = false;
     playbackVideoCarryoverRef.current = null;
     playbackVideoCarryoverPendingRef.current = false;
+    playbackOverlayLastRequestedFrameRef.current = null;
+    playbackOverlayLastRequestWallRef.current = 0;
     setPlaybackVideoDraftTimeSec(null);
 
     const video = playbackVideoRef.current;
@@ -1724,10 +1841,17 @@ export default function App() {
       pausePlaybackVideo();
     }
     refreshPlaybackVideoState();
+    setPlaybackResolvedMapPointCloud(null);
   }, [consoleMode, pausePlaybackVideo, refreshPlaybackVideoState]);
 
   useEffect(() => {
-    if (consoleMode !== "playback" || !playbackStatus || !playbackVideoReady || playbackVideoInitializedRef.current) {
+    if (
+      consoleMode !== "playback" ||
+      !playbackStatus ||
+      !playbackVideoReady ||
+      playbackVideoInitializedRef.current ||
+      playbackVideoInitializingRef.current
+    ) {
       return;
     }
 
@@ -1736,38 +1860,50 @@ export default function App() {
       return;
     }
     let disposed = false;
+    playbackVideoInitializingRef.current = true;
     const applyInitialVideoState = async () => {
-      const targetVideoTimeSec = playbackOffsetToVideoTimeSec(
-        playbackStatus.currentOffsetSec,
-        playbackVideoDurationSec,
-        playbackStatus.durationSec
-      );
-      await seekPlaybackVideo(targetVideoTimeSec);
-      if (disposed) {
-        return;
+      try {
+        const targetVideoTimeSec = playbackOffsetToVideoTimeSec(
+          playbackStatus.currentOffsetSec,
+          playbackVideoDurationSec,
+          playbackStatus.durationSec
+        );
+        await seekPlaybackVideo(targetVideoTimeSec);
+        if (disposed) {
+          return;
+        }
+
+        video.playbackRate = 1;
+
+        if (playbackStatus.paused) {
+          pausePlaybackVideo();
+        } else {
+          await requestPlaybackVideoPlay();
+        }
+
+        if (disposed) {
+          return;
+        }
+
+        playbackVideoInitializedRef.current = true;
+        playbackVideoLastSyncSignatureRef.current = null;
+        refreshPlaybackVideoState();
+        await syncPlaybackToMasterVideo(true);
+      } finally {
+        playbackVideoInitializingRef.current = false;
       }
-
-      video.playbackRate = 1;
-
-      if (playbackStatus.paused) {
-        pausePlaybackVideo();
-      } else {
-        await requestPlaybackVideoPlay();
-      }
-
-      playbackVideoInitializedRef.current = true;
-      playbackVideoLastSyncSignatureRef.current = null;
-      refreshPlaybackVideoState();
-      await syncPlaybackToMasterVideo(true);
     };
 
     void applyInitialVideoState();
     return () => {
       disposed = true;
+      playbackVideoInitializingRef.current = false;
     };
   }, [
     consoleMode,
-    playbackStatus,
+    playbackStatus?.currentOffsetSec,
+    playbackStatus?.durationSec,
+    playbackStatus?.paused,
     playbackVideoDurationSec,
     playbackVideoReady,
     pausePlaybackVideo,
@@ -1877,7 +2013,7 @@ export default function App() {
       viewer.updateTrajectory(displayTrajectory);
       viewer.updatePlannedPath(plannedPath);
       viewer.updateLivePointCloud(rosState.livePointCloud);
-      viewer.updatePlaybackMapPointCloud(rosState.playbackAccumulatedPointCloud);
+      viewer.updatePlaybackMapPointCloud(playbackResolvedMapPointCloud);
       viewer.updatePlaybackScanPointCloud(
         consoleMode === "playback" ? playbackOverlayScan : rosState.playbackScanPointCloud
       );
@@ -1971,8 +2107,8 @@ export default function App() {
   }, [rosState.livePointCloud]);
 
   useEffect(() => {
-    viewerRef.current?.updatePlaybackMapPointCloud(rosState.playbackAccumulatedPointCloud);
-  }, [rosState.playbackAccumulatedPointCloud]);
+    viewerRef.current?.updatePlaybackMapPointCloud(playbackResolvedMapPointCloud);
+  }, [playbackResolvedMapPointCloud]);
 
   useEffect(() => {
     viewerRef.current?.updatePlaybackScanPointCloud(
@@ -2109,7 +2245,7 @@ export default function App() {
   }, [hifiActive, hifiStreamUrlBase]);
 
   useEffect(() => {
-    if (!hifiActive || consoleMode === "playback") {
+    if (!hifiActive || consoleMode === "playback" || (consoleMode === "hifi" && !hifiNativeRendererReady)) {
       hifiLastPublishedPoseRef.current = null;
       hifiLastPublishedAtRef.current = 0;
       return;
@@ -2188,7 +2324,7 @@ export default function App() {
       window.clearTimeout(timeoutId);
       hifiPoseRequestInFlightRef.current = false;
     };
-  }, [consoleMode, hifiActive, hifiApiUrl]);
+  }, [consoleMode, hifiActive, hifiApiUrl, hifiNativeRendererReady]);
 
   useEffect(() => {
     let disposed = false;
@@ -2881,13 +3017,13 @@ export default function App() {
               </section>
             </>
           ) : (
-          <div className={`viewer-stage ${consoleMode === "hifi" ? "hifi-stage" : ""} ${playbackShowcase ? "showcase-stage" : ""}`}>
+          <div className={`viewer-stage ${consoleMode === "hifi" && hifiNativeRendererReady ? "hifi-stage" : ""} ${playbackShowcase ? "showcase-stage" : ""}`}>
             {consoleMode === "playback" && playbackShowcase ? (
               <div className="playback-hidden-master-video" aria-hidden="true">
                 {renderPlaybackMasterVideo("compare-video playback-master-video-hidden")}
               </div>
             ) : null}
-            {consoleMode === "hifi" ? (
+            {consoleMode === "hifi" && hifiNativeRendererReady ? (
               <NativeRenderStage
                 key={`native-stage:${mediaSessionKey}`}
                 streamUrl={hifiVideoStreamUrl}
@@ -2902,7 +3038,11 @@ export default function App() {
                 onStreamFailed={() => setHifiStreamFailed(true)}
               />
             ) : null}
-            <canvas key={`viewer-canvas-main:${mediaSessionKey}`} ref={setMainCanvasRef} className={`main-canvas ${consoleMode === "hifi" ? "remote-control-canvas" : ""}`} />
+            <canvas
+              key={`viewer-canvas-main:${mediaSessionKey}`}
+              ref={setMainCanvasRef}
+              className={`main-canvas ${consoleMode === "hifi" && hifiNativeRendererReady ? "remote-control-canvas" : ""}`}
+            />
             <div className="viewer-overlay top-left">
               <div className="overlay-card">
                 <div className="overlay-title">Main 3D</div>
@@ -2913,9 +3053,11 @@ export default function App() {
                       ? "Showcase playback. Manual orbit with synced RGB inset, accumulated map, current scan, and trajectory accumulated from playback start."
                       : "Bag replay mode. FAST-LIVO2 sidecar publishes a world-frame global map and current scan. Left drag rotates, middle drag pans, wheel zooms."
                     : consoleMode === "hifi"
-                    ? gsControlMode === "fps"
-                      ? "Native GS-SDF render stream. Click viewport to lock mouse, then use WASD on the ground plane and Q/E for height."
-                      : "Native GS-SDF render stream. Left drag rotates, middle drag pans, wheel zooms. Camera pose is forwarded to the backend renderer."
+                    ? hifiNativeRendererReady
+                      ? gsControlMode === "fps"
+                        ? "Native GS-SDF render stream. Click viewport to lock mouse, then use WASD on the ground plane and Q/E for height."
+                        : "Native GS-SDF render stream. Left drag rotates, middle drag pans, wheel zooms. Camera pose is forwarded to the backend renderer."
+                      : "Native HiFi renderer offline. Falling back to browser GS so the scene stays visible."
                     : viewerMode === "live"
                     ? occupancyCloudAssetState === "fallback"
                       ? "Fallback occupancy cloud + geometry overlays. Left drag rotates, middle drag pans, wheel zooms."
@@ -2926,6 +3068,7 @@ export default function App() {
                 </div>
               </div>
             </div>
+            {sceneError ? <div className="viewer-error-overlay">{sceneError}</div> : null}
             <div className="viewer-overlay top-right">
               <div className="overlay-chip-row">
                 <span className="overlay-chip">{workspaceSemantic.badge}</span>
@@ -3462,8 +3605,8 @@ function layerPresetForMode(mode: ConsoleMode): LayerVisibility {
       };
     case "hifi":
       return {
-        gaussian: false,
-        sdfMesh: false,
+        gaussian: true,
+        sdfMesh: true,
         occupancyCloud: false,
         liveCloud: false,
         trajectory: false,
@@ -3473,7 +3616,7 @@ function layerPresetForMode(mode: ConsoleMode): LayerVisibility {
     case "compare":
       return {
         gaussian: true,
-        sdfMesh: false,
+        sdfMesh: true,
         occupancyCloud: false,
         liveCloud: false,
         trajectory: true,
@@ -3516,7 +3659,8 @@ function describeWorkspaceSemantic(
   consoleMode: ConsoleMode,
   viewerMode: ViewerMode,
   rawAssetState: string,
-  streamProfile: "idle" | "neural" | "playback"
+  streamProfile: "idle" | "neural" | "playback",
+  hifiBrowserFallbackActive = false
 ) {
   if (consoleMode === "playback") {
     return {
@@ -3532,7 +3676,9 @@ function describeWorkspaceSemantic(
   if (consoleMode === "hifi") {
     return {
       title: "High fidelity review",
-      detail: "Native GS-SDF render stream with browser camera controls",
+      detail: hifiBrowserFallbackActive
+        ? "Browser GS fallback while native GS-SDF renderer is offline"
+        : "Native GS-SDF render stream with browser camera controls",
       badge: "HiFi"
     };
   }
@@ -3611,7 +3757,8 @@ function describeRenderSemantic(
   consoleMode: ConsoleMode,
   viewerMode: ViewerMode,
   gaussianVariant: string,
-  gsControlMode: GsControlMode
+  gsControlMode: GsControlMode,
+  hifiBrowserFallbackActive = false
 ) {
   if (consoleMode === "playback") {
     return {
@@ -3622,8 +3769,12 @@ function describeRenderSemantic(
 
   if (consoleMode === "hifi") {
     return {
-      title: `Native stream / ${gsControlMode === "fps" ? "FPS" : "Orbit"}`,
-      detail: "Original GS-SDF renderer frames streamed into the web console"
+      title: hifiBrowserFallbackActive
+        ? `${titleCase(gaussianVariant)} fallback / ${gsControlMode === "fps" ? "FPS" : "Orbit"}`
+        : `Native stream / ${gsControlMode === "fps" ? "FPS" : "Orbit"}`,
+      detail: hifiBrowserFallbackActive
+        ? "Browser Spark renderer fallback while native HiFi is unavailable"
+        : "Original GS-SDF renderer frames streamed into the web console"
     };
   }
 
@@ -3820,6 +3971,10 @@ function buildPlaybackTrajectoryFromPoseTrack(
   const clampedEnd = Math.min(frameIndex, poses.length - 1);
   const count = clampedEnd + 1;
   const limit = Math.max(1, maxPoints);
+  if (count <= limit) {
+    return poses.slice(0, clampedEnd + 1);
+  }
+
   const stride = Math.max(1, Math.ceil(count / limit));
   const trajectory: Pose3D[] = [];
   for (let index = 0; index <= clampedEnd; index += stride) {
@@ -3954,6 +4109,65 @@ function buildPlaybackLocalMapPointCloud(
   };
 }
 
+function pickPlaybackAccumulatedMapPointCloudForTarget(
+  targetStampMs: number | null,
+  resolvedAccumulatedMap: DecodedPointCloud | null | undefined,
+  overlayAccumulatedMap: DecodedPointCloud | null | undefined,
+  ...fallbackScans: Array<DecodedPointCloud | null | undefined>
+): DecodedPointCloud | null {
+  if (
+    overlayAccumulatedMap &&
+    (overlayAccumulatedMap.renderedPointCount ?? 0) > 0 &&
+    targetStampMs !== null &&
+    Number.isFinite(targetStampMs)
+  ) {
+    const overlayDelta = Math.abs((overlayAccumulatedMap.stampMs ?? 0) - targetStampMs);
+    const resolvedDelta = resolvedAccumulatedMap
+      ? Math.abs((resolvedAccumulatedMap.stampMs ?? 0) - targetStampMs)
+      : Number.POSITIVE_INFINITY;
+    if (overlayDelta <= resolvedDelta + 300) {
+      return overlayAccumulatedMap;
+    }
+  }
+
+  const cumulativeCandidates = [resolvedAccumulatedMap, overlayAccumulatedMap].filter(
+    (candidate): candidate is DecodedPointCloud =>
+      Boolean(candidate) && (candidate?.renderedPointCount ?? 0) > 0
+  );
+  if (cumulativeCandidates.length > 0) {
+    if (targetStampMs === null || !Number.isFinite(targetStampMs)) {
+      return cumulativeCandidates.reduce((best, candidate) =>
+        candidate.renderedPointCount > best.renderedPointCount ? candidate : best
+      );
+    }
+
+    let best = cumulativeCandidates[0];
+    let bestDelta = Math.abs((best.stampMs ?? 0) - targetStampMs);
+
+    for (const candidate of cumulativeCandidates.slice(1)) {
+      const candidateDelta = Math.abs((candidate.stampMs ?? 0) - targetStampMs);
+      if (candidateDelta + 120 < bestDelta) {
+        best = candidate;
+        bestDelta = candidateDelta;
+        continue;
+      }
+      if (
+        Math.abs(candidateDelta - bestDelta) <= 250 &&
+        candidate.renderedPointCount > best.renderedPointCount
+      ) {
+        best = candidate;
+        bestDelta = candidateDelta;
+      }
+    }
+
+    return best;
+  }
+  const scanFallback = fallbackScans.find(
+    (candidate) => Boolean(candidate) && (candidate?.renderedPointCount ?? 0) > 0
+  );
+  return scanFallback ?? null;
+}
+
 function computePlaybackVideoToBagScale(videoDurationSec: number, playbackDurationSec: number): number {
   if (videoDurationSec <= 0 || playbackDurationSec <= 0) {
     return 1;
@@ -4065,6 +4279,58 @@ function formatPlaybackRate(value: number): string {
     return "0";
   }
   return value >= 10 ? value.toFixed(0) : value.toFixed(1).replace(/\.0$/, "");
+}
+
+function arePlaybackStatusesEquivalent(
+  left: PlaybackStatus | null,
+  right: PlaybackStatus | null
+): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right) {
+    return false;
+  }
+
+  return JSON.stringify({
+    rate: left.rate,
+    paused: left.paused,
+    loop: left.loop,
+    requestedOffsetSec: left.requestedOffsetSec,
+    currentOffsetSec: left.currentOffsetSec,
+    estimatedOffsetSec: left.estimatedOffsetSec,
+    durationSec: left.durationSec,
+    playbackAlive: left.playbackAlive,
+    latestImageStampSec: left.latestImageStampSec,
+    latestPoseStampSec: left.latestPoseStampSec,
+    globalMapPoints: left.globalMapPoints,
+    currentScanPoints: left.currentScanPoints,
+    frameIndex: left.frameIndex,
+    frameCount: left.frameCount,
+    keyframeCount: left.keyframeCount,
+    cacheDir: left.cacheDir,
+    currentPose: left.currentPose,
+    video: left.video
+  }) === JSON.stringify({
+    rate: right.rate,
+    paused: right.paused,
+    loop: right.loop,
+    requestedOffsetSec: right.requestedOffsetSec,
+    currentOffsetSec: right.currentOffsetSec,
+    estimatedOffsetSec: right.estimatedOffsetSec,
+    durationSec: right.durationSec,
+    playbackAlive: right.playbackAlive,
+    latestImageStampSec: right.latestImageStampSec,
+    latestPoseStampSec: right.latestPoseStampSec,
+    globalMapPoints: right.globalMapPoints,
+    currentScanPoints: right.currentScanPoints,
+    frameIndex: right.frameIndex,
+    frameCount: right.frameCount,
+    keyframeCount: right.keyframeCount,
+    cacheDir: right.cacheDir,
+    currentPose: right.currentPose,
+    video: right.video
+  });
 }
 
 function formatSeconds(value: number): string {

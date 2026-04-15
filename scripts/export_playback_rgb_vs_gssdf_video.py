@@ -12,6 +12,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-offset", type=float, default=0.0)
     parser.add_argument("--end-offset", type=float, default=-1.0)
     parser.add_argument("--frame-timeout", type=float, default=1.5)
+    parser.add_argument(
+        "--settle-frames",
+        type=int,
+        default=3,
+        help="After publishing a camera pose, wait for this many new HiFi frames before capturing.",
+    )
     parser.add_argument("--capture-url", default="")
     parser.add_argument("--font-file", default="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
     parser.add_argument("--keep-frames", action="store_true")
@@ -166,16 +173,39 @@ def fetch_bytes(url: str) -> bytes:
         return response.read()
 
 
-def wait_for_new_frame(bridge_url: str, last_stamp: float | None, timeout: float) -> float:
+def fetch_bytes_with_headers(url: str) -> tuple[bytes, dict[str, str]]:
+    with urllib.request.urlopen(url, timeout=20) as response:
+        return response.read(), {k: v for k, v in response.headers.items()}
+
+
+def wait_for_new_frame(bridge_url: str, last_stamp: float | None, timeout: float) -> tuple[float, int]:
     deadline = time.monotonic() + timeout
     newest = last_stamp
+    newest_frames_received = 0
     while time.monotonic() < deadline:
         status = http_get_json(f"{bridge_url.rstrip('/')}/status")
         stamp = status.get("latestFrameStampSec")
+        frames_received = int(status.get("framesReceived", 0) or 0)
         if stamp is not None and stamp != newest:
-            return float(stamp)
+            return float(stamp), frames_received
         time.sleep(0.03)
-    return float(newest or 0.0)
+    return float(newest or 0.0), newest_frames_received
+
+
+def append_query_params(url: str, params: dict[str, str]) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    query_map = dict(query_items)
+    query_map.update(params)
+    return urllib.parse.urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urllib.parse.urlencode(query_map),
+            parsed.fragment,
+        )
+    )
 
 
 def build_selected_frames(meta: dict, fps: float, speed: float, start_offset: float, end_offset: float) -> list[dict]:
@@ -223,7 +253,9 @@ def export_frames(args: argparse.Namespace, selected_frames: list[dict], t_b_c: 
     cache_dir = Path(args.cache_dir)
     bridge_url = args.bridge_url.rstrip("/")
     capture_url = args.capture_url.strip() or f"{bridge_url}/frame.jpg"
-    last_stamp = http_get_json(f"{bridge_url}/status").get("latestFrameStampSec")
+    initial_status = http_get_json(f"{bridge_url}/status")
+    last_stamp = initial_status.get("latestFrameStampSec")
+    last_frames_received = int(initial_status.get("framesReceived", 0) or 0)
 
     for output_index, frame in enumerate(selected_frames):
         source_image = cache_dir / frame["imageFile"]
@@ -232,8 +264,32 @@ def export_frames(args: argparse.Namespace, selected_frames: list[dict], t_b_c: 
 
         camera_pose = pose_to_camera_pose(frame, t_b_c)
         http_post_json(f"{bridge_url}/camera_pose", camera_pose)
-        last_stamp = wait_for_new_frame(bridge_url, last_stamp, args.frame_timeout)
-        right_bytes = fetch_bytes(f"{capture_url}?frame={frame['index']}&ts={time.time_ns()}")
+        # The native GS-SDF renderer can emit one or two transient frames right after a pose
+        # update. Wait for several new frames before sampling the JPEG so the export records
+        # the settled render instead of the intermediate flash.
+        settle_frames = max(int(args.settle_frames), 1)
+        _, observed_frames = wait_for_new_frame(bridge_url, last_stamp, args.frame_timeout)
+        if observed_frames > 0:
+            last_frames_received = observed_frames
+        target_frames_received = last_frames_received + max(settle_frames - 1, 0)
+        capture_request_url = append_query_params(
+            capture_url,
+            {
+                "frame": str(frame["index"]),
+                "ts": str(time.time_ns()),
+                "minFramesReceived": str(target_frames_received),
+                "timeoutMs": str(int(max(args.frame_timeout, 0.1) * 1000.0)),
+            },
+        )
+        right_bytes, headers = fetch_bytes_with_headers(capture_request_url)
+        try:
+            last_frames_received = int(headers.get("X-Frames-Received", str(last_frames_received)))
+        except ValueError:
+            pass
+        try:
+            last_stamp = float(headers.get("X-Frame-Stamp", str(last_stamp or 0.0)))
+        except ValueError:
+            pass
         (right_dir / f"frame_{output_index:05d}.jpg").write_bytes(right_bytes)
 
     return left_dir, right_dir
