@@ -1,5 +1,9 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { Pose3D, SceneManifest } from "../lib/gs/gsSdfSceneAdapter";
+import {
+  getLiveRosTopicName,
+  type LiveContract
+} from "../lib/contracts/liveContract";
 import type {
   GoalPose2D,
   InitialPose2D,
@@ -45,6 +49,7 @@ export interface ObstacleRect2D {
 interface TopDownMapProps {
   manifest: SceneManifest | null;
   ros: RosClient | null;
+  liveContract?: LiveContract | null;
   streamProfile?: "idle" | "neural" | "playback";
   robotPose: Pose3D | null;
   trajectory: Pose3D[];
@@ -151,13 +156,16 @@ export default function TopDownMap(props: TopDownMapProps) {
     return buildMapMetaFromPointCloud(props.mapPointCloud, props.manifest);
   }, [mapMeta, props.mapPointCloud, props.manifest]);
 
-  streamBuildRefLight.current.cloud = props.mapPointCloud ?? null;
+  const hasPrebuiltOccupancy = props.manifest?.occupancy?.source === "prebuilt_grid";
+  const mapCloudForGrid =
+    hasPrebuiltOccupancy && props.streamProfile !== "playback" ? null : props.mapPointCloud;
+
+  streamBuildRefLight.current.cloud = mapCloudForGrid ?? null;
   streamBuildRefLight.current.manifest = props.manifest;
   streamBuildRefLight.current.meta = streamingMapMeta;
 
   useEffect(() => {
-    const useStreamingMapCloud = props.mapPointCloud;
-    if (useStreamingMapCloud && streamingMapMeta && props.manifest) {
+    if (mapCloudForGrid && streamingMapMeta && props.manifest) {
       if (props.streamProfile === "playback") {
         if (playbackGridRafRef.current) {
           return;
@@ -205,7 +213,7 @@ export default function TopDownMap(props: TopDownMapProps) {
         };
       }
       const nextGrid = projectLiveCloudToGrid(
-        sampleDecodedCloudForGrid(useStreamingMapCloud, 36_000),
+        sampleDecodedCloudForGrid(mapCloudForGrid, 36_000),
         props.manifest,
         streamingMapMeta
       );
@@ -244,9 +252,15 @@ export default function TopDownMap(props: TopDownMapProps) {
     let cancelled = false;
 
     const load = async () => {
-      const geometry = await loadPlyGeometry(props.manifest!.occupancy!.url);
-      const points = geometryToPoints(geometry);
-      const nextGrid = projectPointsToGrid(points, props.manifest!, mapMeta);
+      const occupancy = props.manifest!.occupancy!;
+      const nextGrid =
+        occupancy.source === "prebuilt_grid"
+          ? await loadPrebuiltOccupancyGrid(occupancy.url, props.manifest!, mapMeta)
+          : projectPointsToGrid(
+              geometryToPoints(await loadPlyGeometry(occupancy.url)),
+              props.manifest!,
+              mapMeta
+            );
       if (!cancelled) {
         setBaseGrid(nextGrid);
         setViewport(fitViewport(nextGrid, canvasRef.current));
@@ -265,7 +279,7 @@ export default function TopDownMap(props: TopDownMapProps) {
     return () => {
       cancelled = true;
     };
-  }, [mapMeta, streamingMapMeta, props.mapPointCloud, props.manifest, props.streamProfile]);
+  }, [mapCloudForGrid, mapMeta, streamingMapMeta, props.manifest, props.streamProfile]);
 
   const effectiveGrid = useMemo(() => {
     if (!baseGrid) {
@@ -396,7 +410,8 @@ export default function TopDownMap(props: TopDownMapProps) {
     const result = planPathOnGrid({
       grid: effectiveGrid,
       start,
-      goal: latestGoal
+      goal: latestGoal,
+      robotRadius: getLocalPlannerInflationRadius(props.manifest)
     });
 
     props.onPlannedPath(result.path);
@@ -405,6 +420,7 @@ export default function TopDownMap(props: TopDownMapProps) {
     effectiveGrid,
     props.goals,
     props.initialPose,
+    props.manifest,
     props.robotPose,
     props.trajectory
   ]);
@@ -530,8 +546,16 @@ export default function TopDownMap(props: TopDownMapProps) {
           yaw: 0
         };
         if (props.ros) {
-          const topic = createInitialPoseTopic(props.ros);
-          publishInitialPose(topic, pose, mapMeta.frameId);
+          const topicName = getLiveRosTopicName(
+            props.liveContract,
+            "initial_pose",
+            "/initialpose",
+            "publish"
+          );
+          const topic = topicName ? createInitialPoseTopic(props.ros, topicName) : null;
+          if (topic) {
+            publishInitialPose(topic, pose, mapMeta.frameId);
+          }
         }
         props.onInitialPose(pose);
         return;
@@ -544,8 +568,16 @@ export default function TopDownMap(props: TopDownMapProps) {
       };
 
       if (props.ros) {
-        const topic = createMoveBaseGoalTopic(props.ros);
-        publishMoveBaseSimpleGoal(topic, goal, mapMeta.frameId);
+        const topicName = getLiveRosTopicName(
+          props.liveContract,
+          "nav_goal",
+          "/move_base_simple/goal",
+          "publish"
+        );
+        const topic = topicName ? createMoveBaseGoalTopic(props.ros, topicName) : null;
+        if (topic) {
+          publishMoveBaseSimpleGoal(topic, goal, mapMeta.frameId);
+        }
       }
       props.onGoal(goal);
       return;
@@ -651,6 +683,126 @@ function createEmptyGrid(manifest: SceneManifest | null, mapMeta: OccupancyMapMe
     },
     robotRadius: manifest?.robot?.radius ?? 0.28
   });
+}
+
+function getLocalPlannerInflationRadius(manifest: SceneManifest | null): number {
+  // Prebuilt PGM maps are generated for the robot footprint already. Inflating
+  // them again in the browser makes valid NuRec corridors look blocked.
+  if (manifest?.occupancy?.source === "prebuilt_grid") {
+    return 0;
+  }
+  return manifest?.robot?.radius ?? 0.28;
+}
+
+async function loadPrebuiltOccupancyGrid(
+  url: string,
+  manifest: SceneManifest | null,
+  mapMeta: OccupancyMapMeta
+): Promise<OccupancyGrid> {
+  const response = await fetch(url, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch occupancy grid ${url}: ${response.status}`);
+  }
+  const pgm = parsePgm(new Uint8Array(await response.arrayBuffer()));
+  const resolution = manifest?.occupancy?.resolution ?? mapMeta.resolution;
+  const origin = manifest?.occupancy?.origin ?? mapMeta.origin;
+  const grid = createGrid({
+    resolution,
+    bounds: {
+      minX: origin.x,
+      maxX: origin.x + pgm.width * resolution,
+      minY: origin.y,
+      maxY: origin.y + pgm.height * resolution,
+      minZ: manifest?.meta?.mapOrigin?.z ?? 0,
+      maxZ: (manifest?.meta?.mapOrigin?.z ?? 0) + 3
+    },
+    obstacleBand: {
+      minZ: (manifest?.meta?.mapOrigin?.z ?? 0) - 0.1,
+      maxZ: (manifest?.meta?.mapOrigin?.z ?? 0) + 1.3
+    },
+    robotRadius: manifest?.robot?.radius ?? 0.28
+  });
+
+  for (let row = 0; row < pgm.height; row += 1) {
+    const cellY = pgm.height - 1 - row;
+    for (let x = 0; x < pgm.width; x += 1) {
+      const pixel = pgm.pixels[row * pgm.width + x];
+      const normalized = pgm.maxValue > 0 ? (pixel / pgm.maxValue) * 255 : pixel;
+      const index = cellY * pgm.width + x;
+      if (normalized < 128) {
+        grid.data[index] = 100;
+        grid.hits[index] = 8;
+      } else {
+        grid.data[index] = 0;
+      }
+    }
+  }
+
+  return grid;
+}
+
+function parsePgm(bytes: Uint8Array): {
+  width: number;
+  height: number;
+  maxValue: number;
+  pixels: Uint16Array;
+} {
+  let offset = 0;
+
+  const isWhitespace = (value: number) =>
+    value === 9 || value === 10 || value === 13 || value === 32;
+
+  const nextToken = () => {
+    while (offset < bytes.length) {
+      if (bytes[offset] === 35) {
+        while (offset < bytes.length && bytes[offset] !== 10) {
+          offset += 1;
+        }
+      }
+      if (!isWhitespace(bytes[offset])) {
+        break;
+      }
+      offset += 1;
+    }
+    const start = offset;
+    while (offset < bytes.length && !isWhitespace(bytes[offset]) && bytes[offset] !== 35) {
+      offset += 1;
+    }
+    return new TextDecoder("ascii").decode(bytes.subarray(start, offset));
+  };
+
+  const magic = nextToken();
+  const width = Number.parseInt(nextToken(), 10);
+  const height = Number.parseInt(nextToken(), 10);
+  const maxValue = Number.parseInt(nextToken(), 10);
+  if ((magic !== "P5" && magic !== "P2") || !Number.isFinite(width) || !Number.isFinite(height) || !Number.isFinite(maxValue)) {
+    throw new Error("Unsupported PGM occupancy grid.");
+  }
+
+  const pixelCount = width * height;
+  const pixels = new Uint16Array(pixelCount);
+  if (magic === "P2") {
+    for (let index = 0; index < pixelCount; index += 1) {
+      pixels[index] = Number.parseInt(nextToken(), 10);
+    }
+    return { width, height, maxValue, pixels };
+  }
+
+  while (offset < bytes.length && isWhitespace(bytes[offset])) {
+    offset += 1;
+  }
+  if (maxValue <= 255) {
+    for (let index = 0; index < pixelCount; index += 1) {
+      pixels[index] = bytes[offset + index] ?? 0;
+    }
+  } else {
+    for (let index = 0; index < pixelCount; index += 1) {
+      const hi = bytes[offset + index * 2] ?? 0;
+      const lo = bytes[offset + index * 2 + 1] ?? 0;
+      pixels[index] = hi * 256 + lo;
+    }
+  }
+  return { width, height, maxValue, pixels };
 }
 
 function projectPointsToGrid(

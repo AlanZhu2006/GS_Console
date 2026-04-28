@@ -1,6 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { GaussianSource, LayerVisibility, Pose3D, SceneManifest } from "./lib/gs/gsSdfSceneAdapter";
 import {
+  DEFAULT_CAPABILITY_MATRIX_URL,
+  adapterSupportsArtifact,
+  adapterSupportsInboundChannel,
+  adapterSupportsLiveProfile,
+  adapterSupportsOutboundChannel,
+  parseCapabilityMatrix,
+  resolveAdapterCapability,
+  type AdapterCapability,
+  type CapabilityMatrix
+} from "./lib/contracts/capabilityMatrix";
+import {
+  DEFAULT_LIVE_CONTRACT_URL,
+  getLiveHttpEndpoint,
+  getLiveRosTopicName,
+  parseLiveContract,
+  resolveLiveContractUrl,
+  type LiveContract
+} from "./lib/contracts/liveContract";
+import { useHttpLiveState } from "./lib/http/useHttpLiveState";
+import {
   createCurrentCameraPoseTopic,
   publishCurrentCameraPose,
   type GoalPose2D,
@@ -176,6 +196,7 @@ interface PlaybackLocalMapState {
 interface HiFiStatus {
   mode: string;
   ready: boolean;
+  liveRenderPoseMode?: "always" | "manual-hold" | "never";
   imageTopic: string;
   poseTopic: string;
   sourceContainer: string;
@@ -202,10 +223,62 @@ interface HiFiWindowStatus {
   label: string;
 }
 
+interface WorldNavGoal {
+  label: string;
+  cell?: [number, number] | null;
+  world?: { x: number; y: number } | null;
+  source?: string;
+  lastResult?: string | null;
+  lastReason?: string | null;
+}
+
+interface WorldNavEpisodeSummary {
+  episode?: number;
+  goal_cell?: [number, number];
+  goal_xy?: [number, number, number];
+  result?: string;
+  reason?: string;
+  duration_sec?: number;
+}
+
+interface WorldNavStatus {
+  mode: string;
+  ready: boolean;
+  running: boolean;
+  returnCode: number | null;
+  currentTask: {
+    command?: string;
+    goalLabel?: string | null;
+    semanticGoal?: string | null;
+    goalCell?: [number, number] | null;
+    goalWorld?: { x: number; y: number } | null;
+    reportPath?: string;
+    logPath?: string;
+  } | null;
+  semanticGoals: WorldNavGoal[];
+  lastError: string | null;
+  lastReportPath: string | null;
+  lastLogPath: string | null;
+  lastReport?: {
+    counts?: Record<string, number>;
+    episodeCount?: number;
+    goalSource?: string;
+    episodes?: WorldNavEpisodeSummary[];
+  } | null;
+}
+
 export default function App() {
   const searchParams = useMemo(() => new URLSearchParams(window.location.search), []);
   const sceneUrl = useMemo(
     () => searchParams.get("scene") ?? defaultSceneUrl,
+    [searchParams]
+  );
+  const requestedLiveContractUrl = useMemo(
+    () => searchParams.get("liveContract"),
+    [searchParams]
+  );
+  const requestedCapabilityMatrixUrl = useMemo(
+    () => searchParams.get("capabilityMatrix"),
     [searchParams]
   );
   const initialConsoleMode = useMemo<ConsoleMode>(() => {
@@ -244,13 +317,20 @@ export default function App() {
   const defaultPlaybackApiUrl = useMemo(() => "/__playback_control", []);
   const defaultHiFiApiUrl = useMemo(() => "/__hifi_bridge", []);
   const defaultHiFiStreamUrl = useMemo(() => "/__hifi_window", []);
+  const defaultWorldNavApiUrl = useMemo(() => "/__world_nav", []);
 
   const [wsUrl, setWsUrl] = useState(defaultWsUrl);
   const [playbackApiUrl, setPlaybackApiUrl] = useState(defaultPlaybackApiUrl);
   const [hifiApiUrl, setHifiApiUrl] = useState(defaultHiFiApiUrl);
   const [hifiStreamUrlBase, setHiFiStreamUrlBase] = useState(defaultHiFiStreamUrl);
   const [manifest, setManifest] = useState<SceneManifest | null>(null);
+  const [liveGaussianPatch, setLiveGaussianPatch] = useState<Partial<SceneManifest> | null>(null);
+  const [liveContract, setLiveContract] = useState<LiveContract | null>(null);
+  const [liveContractError, setLiveContractError] = useState<string | null>(null);
+  const [capabilityMatrix, setCapabilityMatrix] = useState<CapabilityMatrix | null>(null);
+  const [capabilityMatrixError, setCapabilityMatrixError] = useState<string | null>(null);
   const [consoleMode, setConsoleMode] = useState<ConsoleMode>(initialConsoleMode);
+  const restoredInitialConsoleModeRef = useRef(false);
   const [gsControlMode, setGsControlMode] = useState<GsControlMode>(initialGsControlMode);
   const [gaussianVariant, setGaussianVariant] = useState<string | null>(initialGaussianVariant);
   const [playbackCloudMode, setPlaybackCloudMode] = useState<PlaybackCloudMode>(initialPlaybackCloudMode);
@@ -310,6 +390,10 @@ export default function App() {
   const [hifiError, setHifiError] = useState<string | null>(null);
   const [hifiStreamFailed, setHifiStreamFailed] = useState(false);
   const [hifiInteractive, setHifiInteractive] = useState(false);
+  const [worldNavApiUrl, setWorldNavApiUrl] = useState(defaultWorldNavApiUrl);
+  const [worldNavStatus, setWorldNavStatus] = useState<WorldNavStatus | null>(null);
+  const [worldNavError, setWorldNavError] = useState<string | null>(null);
+  const [selectedSemanticGoal, setSelectedSemanticGoal] = useState<string>("");
   const playbackStatusRequestInFlightRef = useRef(false);
   const playbackStatusFailureCountRef = useRef(0);
   const playbackStatusRef = useRef<PlaybackStatus | null>(null);
@@ -362,6 +446,10 @@ export default function App() {
     lastFrameIndex: null
   });
   const sceneManifestSignatureRef = useRef<string | null>(null);
+  const liveGaussianPatchSignatureRef = useRef<string | null>(null);
+  const liveContractSignatureRef = useRef<string | null>(null);
+  const capabilityMatrixSignatureRef = useRef<string | null>(null);
+  const appliedSceneInitialViewKeyRef = useRef<string | null>(null);
   const playbackVideoCurrentTimeStateRef = useRef(0);
   const playbackVideoPresentedTimeStateRef = useRef<number | null>(null);
   const playbackVideoPausedStateRef = useRef(true);
@@ -383,6 +471,25 @@ export default function App() {
     setPlaybackStatus((current) =>
       arePlaybackStatusesEquivalent(current, nextStatus) ? current : nextStatus
     );
+  }, []);
+
+  const applyManifestInitialView = useCallback((
+    viewer: LiveGsViewer | null,
+    nextManifest: SceneManifest | null,
+    mode: ConsoleMode
+  ): boolean => {
+    if (!viewer || (mode !== "gs" && mode !== "hifi") || !nextManifest?.initialView) {
+      return false;
+    }
+
+    const nextKey = buildSceneInitialViewKey(nextManifest);
+    if (!nextKey || appliedSceneInitialViewKeyRef.current === nextKey) {
+      return false;
+    }
+
+    viewer.setCameraPose(nextManifest.initialView.pose, nextManifest.initialView.target);
+    appliedSceneInitialViewKeyRef.current = nextKey;
+    return true;
   }, []);
 
   useEffect(() => {
@@ -626,27 +733,27 @@ export default function App() {
     const medium = playbackEffectiveRate >= 2;
     if (playbackShowcase) {
       return {
-        scanMaxPoints: fast ? 12_000 : medium ? 11_000 : 10_000,
+        scanMaxPoints: fast ? 8_500 : medium ? 8_000 : 7_000,
         scanHistoryFrames: fast ? 5 : medium ? 4 : 3,
-        mapMaxPoints: fast ? 24_000 : medium ? 28_000 : 32_000,
+        mapMaxPoints: fast ? 56_000 : medium ? 72_000 : 96_000,
         minRequestGapMs: fast ? 40 : medium ? 60 : 80,
-        mapRequestGapMs: fast ? 180 : medium ? 240 : 320,
+        mapRequestGapMs: fast ? 240 : medium ? 320 : 460,
         minFrameDelta: 1,
         mapMinFrameDelta: fast ? 2 : medium ? 2 : 1,
-        localAccumulatedMaxPoints: fast ? 360_000 : medium ? 440_000 : 520_000,
-        localAccumulatedVoxelSize: fast ? 0.085 : 0.08
+        localAccumulatedMaxPoints: fast ? 600_000 : medium ? 800_000 : 1_000_000,
+        localAccumulatedVoxelSize: fast ? 0.065 : 0.06
       };
     }
     return {
-      scanMaxPoints: fast ? 10_000 : medium ? 9_200 : 8_000,
+      scanMaxPoints: fast ? 7_400 : medium ? 6_800 : 6_000,
       scanHistoryFrames: fast ? 4 : medium ? 3 : 2,
-      mapMaxPoints: fast ? 12_000 : medium ? 16_000 : 20_000,
+      mapMaxPoints: fast ? 32_000 : medium ? 44_000 : 56_000,
       minRequestGapMs: fast ? 45 : medium ? 65 : 95,
-      mapRequestGapMs: fast ? 220 : medium ? 300 : 380,
+      mapRequestGapMs: fast ? 280 : medium ? 360 : 500,
       minFrameDelta: 1,
       mapMinFrameDelta: fast ? 2 : medium ? 2 : 1,
-      localAccumulatedMaxPoints: fast ? 180_000 : medium ? 240_000 : 300_000,
-      localAccumulatedVoxelSize: fast ? 0.1 : 0.09
+      localAccumulatedMaxPoints: fast ? 320_000 : medium ? 420_000 : 560_000,
+      localAccumulatedVoxelSize: fast ? 0.075 : 0.07
     };
   }, [playbackEffectiveRate, playbackShowcase]);
   const playbackCloudOptions = useMemo<PlaybackCloudOptions>(
@@ -664,27 +771,128 @@ export default function App() {
     }),
     [playbackCloudProfile, playbackDecaySec, playbackShowcase]
   );
-  const rosState = useNeuralMappingRos(wsUrl, {
+  const resolvedSceneUrl = useMemo(
+    () => new URL(sceneUrl, window.location.href).toString(),
+    [sceneUrl]
+  );
+  const liveContractUrl = useMemo(() => {
+    if (requestedLiveContractUrl) {
+      return resolveLiveContractUrl(requestedLiveContractUrl, window.location.href);
+    }
+    if (manifest?.source?.liveContractUrl) {
+      return resolveLiveContractUrl(manifest.source.liveContractUrl, resolvedSceneUrl);
+    }
+    return DEFAULT_LIVE_CONTRACT_URL;
+  }, [manifest?.source?.liveContractUrl, requestedLiveContractUrl, resolvedSceneUrl]);
+  const capabilityMatrixUrl = useMemo(() => {
+    if (requestedCapabilityMatrixUrl) {
+      return resolveLiveContractUrl(requestedCapabilityMatrixUrl, window.location.href);
+    }
+    if (manifest?.source?.capabilityMatrixUrl) {
+      return resolveLiveContractUrl(manifest.source.capabilityMatrixUrl, resolvedSceneUrl);
+    }
+    return DEFAULT_CAPABILITY_MATRIX_URL;
+  }, [manifest?.source?.capabilityMatrixUrl, requestedCapabilityMatrixUrl, resolvedSceneUrl]);
+  const baseRosState = useNeuralMappingRos(wsUrl, {
+    liveContract,
     playbackCloud: playbackCloudOptions,
     playbackTargetStampMs:
       consoleMode === "playback" ? playbackStatus?.currentPose?.stampMs ?? null : null
   });
-  hifiManifestCameraRef.current = manifest?.camera;
+  const httpLiveState = useHttpLiveState(liveContract);
+  const liveGaussianManifestEndpoint = useMemo(
+    () => {
+      const endpoint = getLiveHttpEndpoint(liveContract, "gaussian_manifest", "subscribe");
+      return endpoint ? resolveLiveContractUrl(endpoint, window.location.href) : null;
+    },
+    [liveContract]
+  );
+  const hasHttpLiveFeed = useMemo(
+    () =>
+      Boolean(
+        getLiveHttpEndpoint(liveContract, "robot_pose", "subscribe") ||
+          getLiveHttpEndpoint(liveContract, "trajectory", "subscribe") ||
+          getLiveHttpEndpoint(liveContract, "live_point_cloud", "subscribe")
+      ),
+    [liveContract]
+  );
+  const rosState = useMemo(
+    () =>
+      hasHttpLiveFeed
+        ? {
+            ...baseRosState,
+            connectionState: httpLiveState.connectionState,
+            streamProfile: httpLiveState.streamProfile,
+            robotPose: httpLiveState.robotPose ?? baseRosState.robotPose,
+            trajectory: httpLiveState.trajectory.length > 0 ? httpLiveState.trajectory : baseRosState.trajectory,
+            livePointCloud: httpLiveState.livePointCloud ?? baseRosState.livePointCloud,
+            errorMessage: httpLiveState.errorMessage ?? baseRosState.errorMessage
+          }
+        : baseRosState,
+    [baseRosState, hasHttpLiveFeed, httpLiveState]
+  );
+  const adapterCapability = useMemo(
+    () => resolveAdapterCapability(capabilityMatrix, manifest?.source?.kind),
+    [capabilityMatrix, manifest?.source?.kind]
+  );
+  const navGoalTopicName = useMemo(
+    () => getLiveRosTopicName(liveContract, "nav_goal", "/move_base_simple/goal", "publish"),
+    [liveContract]
+  );
+  const initialPoseTopicName = useMemo(
+    () => getLiveRosTopicName(liveContract, "initial_pose", "/initialpose", "publish"),
+    [liveContract]
+  );
+  const cameraPoseTopicName = useMemo(
+    () => getLiveRosTopicName(liveContract, "camera_pose", "/rviz/current_camera_pose", "publish"),
+    [liveContract]
+  );
+  const playbackGlobalMapTopicName = useMemo(
+    () => getLiveRosTopicName(liveContract, "playback_global_map", "/fastlivo/global_map_web", "subscribe"),
+    [liveContract]
+  );
+  const playbackCurrentScanWorldTopicName = useMemo(
+    () =>
+      getLiveRosTopicName(
+        liveContract,
+        "playback_current_scan_world",
+        "/fastlivo/current_scan_world_web",
+        "subscribe"
+      ),
+    [liveContract]
+  );
+  const playbackRgbTopicName = useMemo(
+    () => getLiveRosTopicName(liveContract, "playback_rgb", "/origin_img", "subscribe"),
+    [liveContract]
+  );
+  const sceneManifest = useMemo(
+    () => mergeSceneManifest(manifest, liveGaussianPatch),
+    [manifest, liveGaussianPatch]
+  );
+  const capabilities = useMemo(
+    () => deriveUiCapabilities(adapterCapability, sceneManifest, {
+      navGoalTopicName,
+      initialPoseTopicName,
+      cameraPoseTopicName
+    }),
+    [adapterCapability, cameraPoseTopicName, initialPoseTopicName, navGoalTopicName, sceneManifest]
+  );
+  hifiManifestCameraRef.current = sceneManifest?.camera;
   const effectiveManifest = useMemo(
-    () => resolveGaussianVariant(manifest, gaussianVariant),
-    [manifest, gaussianVariant]
+    () => resolveGaussianVariant(sceneManifest, gaussianVariant),
+    [sceneManifest, gaussianVariant]
   );
   const gaussianVariants = useMemo(
-    () => getGaussianVariants(manifest),
-    [manifest]
+    () => getGaussianVariants(sceneManifest),
+    [sceneManifest]
   );
   const activeGaussianVariant =
     gaussianVariant ??
     effectiveManifest?.gaussian?.variant ??
-    manifest?.gaussian?.variant ??
+    sceneManifest?.gaussian?.variant ??
     gaussianVariants[0]?.[0] ??
     "quality";
-  const occupancyCloudAssetState = manifest?.assets?.rawPointCloud ?? "loading";
+  const occupancyCloudAssetState = sceneManifest?.assets?.rawPointCloud ?? "loading";
   const occupancyCloudLabel =
     consoleMode === "playback"
       ? "Accumulated Map"
@@ -694,6 +902,18 @@ export default function App() {
   const liveCloudLabel = consoleMode === "playback" ? "Current Scan" : "ROS Cloud";
   const viewerPresentationMode: PresentationMode = playbackShowcase ? "showcase" : "default";
   const effectiveFollowRobot = followRobot;
+  const externalViewer = sceneManifest?.externalViewer ?? null;
+  const hasExternalViewer = Boolean(externalViewer?.url);
+  const externalViewerEndpoint = useMemo(() => {
+    const contractEndpoint = getLiveHttpEndpoint(liveContract, "external_viewer", "subscribe");
+    if (contractEndpoint) {
+      return resolveLiveContractUrl(contractEndpoint, window.location.href);
+    }
+    if (externalViewer?.url) {
+      return resolveLiveContractUrl(externalViewer.url, resolvedSceneUrl);
+    }
+    return null;
+  }, [externalViewer?.url, liveContract, resolvedSceneUrl]);
 
   const viewerMode: ViewerMode =
     consoleMode === "gs" || consoleMode === "hifi" || consoleMode === "compare"
@@ -726,9 +946,17 @@ export default function App() {
           layers.occupancyCloud ? "Accumulated playback map" : null
         ].filter(Boolean).join(" + ") || "Playback geometry / overlays"
       : viewerMode === "gs"
-      ? layers.sdfMesh
+      ? hasExternalViewer && !sceneManifest?.gaussian && !sceneManifest?.mesh && !sceneManifest?.rawPointCloud
+        ? "External 3D viewer"
+        : layers.sdfMesh
         ? "Gaussian + mesh"
-        : "Gaussian"
+        : sceneManifest?.gaussian
+          ? "Gaussian"
+          : sceneManifest?.rawPointCloud
+            ? "Static cloud"
+            : hasExternalViewer
+              ? "External viewer"
+              : "Gaussian"
       : layers.occupancyCloud && occupancyCloudAssetState === "fallback"
         ? "Fallback occupancy cloud"
         : layers.liveCloud
@@ -741,20 +969,29 @@ export default function App() {
     viewerMode,
     occupancyCloudAssetState,
     rosState.streamProfile,
-    hifiBrowserFallbackActive
+    hifiBrowserFallbackActive,
+    hasExternalViewer
   );
   const dataSemantic = describeDataSemantic(
     rosState.connectionState,
     rosState.streamProfile,
     consoleMode === "playback" ? rosState.playbackAccumulatedPointCloud ?? rosState.livePointCloud : rosState.livePointCloud,
-    occupancyCloudAssetState
+    occupancyCloudAssetState,
+    {
+      playbackGlobalMapTopicName,
+      playbackCurrentScanWorldTopicName,
+      playbackRgbTopicName
+    },
+    adapterCapability?.displayName,
+    hasExternalViewer
   );
   const renderSemantic = describeRenderSemantic(
     consoleMode,
     viewerMode,
     activeGaussianVariant,
     gsControlMode,
-    hifiBrowserFallbackActive
+    hifiBrowserFallbackActive,
+    hasExternalViewer
   );
   const playbackVideoDescriptor = useMemo<PlaybackVideoDescriptor | null>(
     () => playbackStatus?.video ?? null,
@@ -957,6 +1194,23 @@ export default function App() {
       : navPreviewActive || navPreviewTrajectory.length > 1
         ? navPreviewTrajectory
         : playbackDisplayTrajectory;
+  const layerAvailability = useMemo(
+    () =>
+      deriveLayerAvailability(
+        capabilities,
+        sceneManifest,
+        consoleMode,
+        hasLiveCloud,
+        displayRobotPose,
+        displayTrajectory.length
+      ),
+    [capabilities, consoleMode, displayRobotPose, displayTrajectory.length, hasLiveCloud, sceneManifest]
+  );
+  useEffect(() => {
+    setLayers((current) =>
+      sanitizeLayerVisibilityWithAvailability(current, layerAvailability, consoleMode, playbackShowcase)
+    );
+  }, [consoleMode, layerAvailability, playbackShowcase]);
   const playbackTimelineDisabled = !playbackStatus || !playbackVideoReady;
   const visiblePlaybackError =
     playbackError ??
@@ -986,6 +1240,13 @@ export default function App() {
   const hifiBridgePreviewFrameUrl = useMemo(
     () => buildPlaybackVideoUrl(hifiApiUrl, "/frame.preview.jpg"),
     [hifiApiUrl]
+  );
+  const externalViewerFrameUrl = useMemo(
+    () =>
+      externalViewerEndpoint
+        ? buildPlaybackVideoUrl(externalViewerEndpoint, consoleMode === "gs" ? "/frame/rgb.jpg" : "/frame.jpg")
+        : null,
+    [consoleMode, externalViewerEndpoint]
   );
   const mediaSessionKey = useMemo(
     () =>
@@ -1043,6 +1304,14 @@ export default function App() {
     playbackGsComparePose,
     playbackStatus
   ]);
+
+  const showExternalFrameStage =
+    consoleMode === "gs" &&
+    externalViewer?.kind === "http-mjpeg" &&
+    Boolean(externalViewerFrameUrl) &&
+    !sceneManifest?.gaussian &&
+    !sceneManifest?.mesh &&
+    !sceneManifest?.rawPointCloud;
   const renderPlaybackMasterVideo = (className = "compare-video"): ReactNode => (
     <video
       ref={setPlaybackVideoNode}
@@ -2279,6 +2548,7 @@ export default function App() {
     try {
       const viewer = new LiveGsViewer(mainCanvasNode);
       viewerRef.current = viewer;
+      appliedSceneInitialViewKeyRef.current = null;
       viewer.setMode(viewerMode);
       viewer.setPresentationMode(viewerPresentationMode);
       viewer.setGsControlMode(gsControlMode);
@@ -2293,10 +2563,6 @@ export default function App() {
       viewer.updatePlaybackScanPointCloud(
         consoleMode === "playback" ? playbackOverlayScan : rosState.playbackScanPointCloud
       );
-      if (consoleMode === "hifi") {
-        viewer.setCameraPose(HIFI_DEFAULT_CAMERA_POSE, HIFI_DEFAULT_TARGET);
-        hifiInitializedRef.current = true;
-      }
       viewer.setPlaybackCompareUsesWebGs(
         consoleMode === "playback" && !playbackShowcase && playbackCompareMode === "webgs"
       );
@@ -2304,6 +2570,7 @@ export default function App() {
         void viewer.loadManifest(effectiveManifest).then(
           () => {
             if (!disposed) {
+              applyManifestInitialView(viewer, effectiveManifest, consoleMode);
               setSceneError(null);
             }
           },
@@ -2326,7 +2593,7 @@ export default function App() {
       viewerRef.current = null;
       return;
     }
-  }, [mainCanvasNode]);
+  }, [applyManifestInitialView, mainCanvasNode]);
 
   useEffect(() => {
     viewerRef.current?.setMode(viewerMode);
@@ -2342,13 +2609,21 @@ export default function App() {
       return;
     }
 
-    if (hifiInitializedRef.current) {
+    const viewer = viewerRef.current;
+    if (!viewer) {
       return;
     }
 
-    viewerRef.current?.setCameraPose(HIFI_DEFAULT_CAMERA_POSE, HIFI_DEFAULT_TARGET);
+    if (!hifiInitializedRef.current) {
+      appliedSceneInitialViewKeyRef.current = null;
+    }
+
+    const applied = applyManifestInitialView(viewer, effectiveManifest, consoleMode);
+    if (!applied && !hifiInitializedRef.current) {
+      viewer.setCameraPose(HIFI_DEFAULT_CAMERA_POSE, HIFI_DEFAULT_TARGET);
+    }
     hifiInitializedRef.current = true;
-  }, [consoleMode]);
+  }, [applyManifestInitialView, consoleMode, effectiveManifest]);
 
   useEffect(() => {
     viewerRef.current?.setGsControlMode(gsControlMode);
@@ -2393,11 +2668,11 @@ export default function App() {
   }, [consoleMode, playbackOverlayScan, rosState.playbackScanPointCloud]);
 
   useEffect(() => {
-    if (!rosState.ros || consoleMode === "hifi" || consoleMode === "playback") {
+    if (!rosState.ros || consoleMode === "hifi" || consoleMode === "playback" || !cameraPoseTopicName) {
       return;
     }
 
-    const cameraTopic = createCurrentCameraPoseTopic(rosState.ros);
+    const cameraTopic = createCurrentCameraPoseTopic(rosState.ros, cameraPoseTopicName);
     const publish = () => {
       const pose = viewerRef.current?.getCameraPose();
       if (!pose) {
@@ -2411,7 +2686,7 @@ export default function App() {
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [consoleMode, rosState.ros]);
+  }, [cameraPoseTopicName, consoleMode, rosState.ros]);
 
   useEffect(() => {
     setHifiStreamFailed(false);
@@ -2521,7 +2796,54 @@ export default function App() {
   }, [hifiActive, hifiStreamUrlBase]);
 
   useEffect(() => {
-    if (!hifiActive || consoleMode === "playback" || (consoleMode === "hifi" && !hifiNativeRendererReady)) {
+    let disposed = false;
+
+    const load = async () => {
+      const candidates = buildControlUrlCandidates(worldNavApiUrl, "/__world_nav", 8892);
+      let lastError: unknown = null;
+
+      for (const candidate of candidates) {
+        try {
+          const response = await fetch(`${candidate}/status`, { cache: "no-store" });
+          if (!response.ok) {
+            throw new Error(`World nav returned ${response.status}`);
+          }
+          const status = (await response.json()) as WorldNavStatus;
+          if (!disposed) {
+            if (candidate !== worldNavApiUrl) {
+              setWorldNavApiUrl(candidate);
+            }
+            setWorldNavStatus(status);
+            setWorldNavError(null);
+            if (!selectedSemanticGoal && status.semanticGoals?.length) {
+              setSelectedSemanticGoal(status.semanticGoals[0].label);
+            }
+          }
+          return;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+
+      if (!disposed) {
+        setWorldNavError(lastError instanceof Error ? lastError.message : "World nav module unavailable.");
+      }
+    };
+
+    void load();
+    const intervalId = window.setInterval(load, 1200);
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+    };
+  }, [selectedSemanticGoal, worldNavApiUrl]);
+
+  useEffect(() => {
+    if (
+      !hifiActive ||
+      consoleMode === "playback" ||
+      (consoleMode === "hifi" && (!hifiNativeRendererReady || hifiStatus?.liveRenderPoseMode === "always"))
+    ) {
       hifiLastPublishedPoseRef.current = null;
       hifiLastPublishedAtRef.current = 0;
       return;
@@ -2600,7 +2922,7 @@ export default function App() {
       window.clearTimeout(timeoutId);
       hifiPoseRequestInFlightRef.current = false;
     };
-  }, [consoleMode, hifiActive, hifiApiUrl, hifiNativeRendererReady]);
+  }, [consoleMode, hifiActive, hifiApiUrl, hifiNativeRendererReady, hifiStatus?.liveRenderPoseMode]);
 
   useEffect(() => {
     let disposed = false;
@@ -2615,14 +2937,15 @@ export default function App() {
         if (disposed) {
           return;
         }
-        if (sceneManifestSignatureRef.current === rawManifest) {
-          return;
-        }
-        const nextManifest = JSON.parse(rawManifest) as SceneManifest;
+        const nextManifest = await hydrateSceneManifestVisualLayer(JSON.parse(rawManifest) as SceneManifest, sceneUrl);
         if (disposed) {
           return;
         }
-        sceneManifestSignatureRef.current = rawManifest;
+        const nextSignature = JSON.stringify(nextManifest);
+        if (sceneManifestSignatureRef.current === nextSignature) {
+          return;
+        }
+        sceneManifestSignatureRef.current = nextSignature;
         setManifest(nextManifest);
         setSceneError(null);
       } catch (error) {
@@ -2644,6 +2967,138 @@ export default function App() {
     let disposed = false;
 
     const load = async () => {
+      try {
+        const response = await fetch(liveContractUrl, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`Failed to load live contract: ${response.status}`);
+        }
+        const rawContract = await response.text();
+        if (disposed) {
+          return;
+        }
+        if (liveContractSignatureRef.current === rawContract) {
+          return;
+        }
+        const nextContract = parseLiveContract(JSON.parse(rawContract));
+        if (disposed) {
+          return;
+        }
+        liveContractSignatureRef.current = rawContract;
+        setLiveContract(nextContract);
+        setLiveContractError(null);
+      } catch (error) {
+        if (disposed) {
+          return;
+        }
+        liveContractSignatureRef.current = null;
+        setLiveContract(null);
+        setLiveContractError(
+          error instanceof Error
+            ? `${error.message}. Falling back to built-in ROS topic defaults.`
+            : "Failed to load live contract. Falling back to built-in ROS topic defaults."
+        );
+      }
+    };
+
+    void load();
+    const intervalId = window.setInterval(load, 5000);
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+    };
+  }, [liveContractUrl]);
+
+  useEffect(() => {
+    if (!liveGaussianManifestEndpoint) {
+      liveGaussianPatchSignatureRef.current = null;
+      setLiveGaussianPatch(null);
+      return;
+    }
+
+    let disposed = false;
+
+    const load = async () => {
+      try {
+        const response = await fetch(liveGaussianManifestEndpoint, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`Failed to load live gaussian manifest: ${response.status}`);
+        }
+        const payload = extractGaussianManifestPatch(await response.json());
+        if (disposed) {
+          return;
+        }
+        const signature = payload ? JSON.stringify(payload) : "";
+        if (liveGaussianPatchSignatureRef.current === signature) {
+          return;
+        }
+        liveGaussianPatchSignatureRef.current = signature;
+        setLiveGaussianPatch(payload);
+      } catch {
+        if (disposed) {
+          return;
+        }
+        liveGaussianPatchSignatureRef.current = null;
+        setLiveGaussianPatch(null);
+      }
+    };
+
+    void load();
+    const intervalId = window.setInterval(load, 1200);
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+    };
+  }, [liveGaussianManifestEndpoint]);
+
+  useEffect(() => {
+    let disposed = false;
+
+    const load = async () => {
+      try {
+        const response = await fetch(capabilityMatrixUrl, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`Failed to load capability matrix: ${response.status}`);
+        }
+        const rawMatrix = await response.text();
+        if (disposed) {
+          return;
+        }
+        if (capabilityMatrixSignatureRef.current === rawMatrix) {
+          return;
+        }
+        const nextMatrix = parseCapabilityMatrix(JSON.parse(rawMatrix));
+        if (disposed) {
+          return;
+        }
+        capabilityMatrixSignatureRef.current = rawMatrix;
+        setCapabilityMatrix(nextMatrix);
+        setCapabilityMatrixError(null);
+      } catch (error) {
+        if (disposed) {
+          return;
+        }
+        capabilityMatrixSignatureRef.current = null;
+        setCapabilityMatrix(null);
+        setCapabilityMatrixError(
+          error instanceof Error
+            ? `${error.message}. Falling back to inferred UI capabilities.`
+            : "Failed to load capability matrix. Falling back to inferred UI capabilities."
+        );
+      }
+    };
+
+    void load();
+    const intervalId = window.setInterval(load, 5000);
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+    };
+  }, [capabilityMatrixUrl]);
+
+  useEffect(() => {
+    let disposed = false;
+
+    const load = async () => {
       if (!effectiveManifest) {
         return;
       }
@@ -2657,6 +3112,7 @@ export default function App() {
 
       try {
         await viewerRef.current?.loadManifest(effectiveManifest);
+        applyManifestInitialView(viewerRef.current, effectiveManifest, consoleMode);
         if (!disposed) {
           setSceneError(null);
         }
@@ -2671,9 +3127,13 @@ export default function App() {
     return () => {
       disposed = true;
     };
-  }, [consoleMode, effectiveManifest]);
+  }, [applyManifestInitialView, consoleMode, effectiveManifest]);
 
   const applyConsoleMode = (nextMode: ConsoleMode) => {
+    const nextModeOption = workspaceModeOptions.find((option) => option.mode === nextMode);
+    if (nextModeOption && !nextModeOption.enabled) {
+      return;
+    }
     setSceneError(null);
     if (nextMode !== "playback") {
       setPlaybackBusy(false);
@@ -2853,37 +3313,132 @@ export default function App() {
 
   const compareReferenceFrame = rosState.rgbFrame ?? rosState.depthFrame;
   const compareReferenceLabel = rosState.rgbFrame ? "Rendered RGB" : rosState.depthFrame ? "Rendered Depth" : "Reference Render";
-  const workspaceModes: ConsoleMode[] = showAdvanced
-    ? ["playback", "live", "gs", "hifi", "compare"]
-    : ["playback", "live", "gs", "hifi"];
-  const navTools: Array<readonly [MapTool, string]> = showAdvanced
-    ? [
-        ["goal", "Goal"],
-        ["initialPose", "Initial Pose"],
-        ["measure", "Measure"],
-        ["obstacle", "Obstacle"],
-        ["erase", "Erase"]
-      ]
-    : [
-        ["goal", "Goal"],
-        ["initialPose", "Initial Pose"],
-        ["obstacle", "Obstacle"],
-        ["erase", "Erase"]
-      ];
+  const latestPointGoal = goals.length > 0 ? goals[goals.length - 1] : null;
+  const sendWorldNavControl = useCallback(
+    async (payload: Record<string, unknown>) => {
+      const candidates = buildControlUrlCandidates(worldNavApiUrl, "/__world_nav", 8892);
+      let lastError: unknown = null;
+      for (const candidate of candidates) {
+        try {
+          const response = await fetch(`${candidate}/control`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          const status = (await response.json()) as WorldNavStatus | { error?: string; status?: WorldNavStatus };
+          if (!response.ok) {
+            throw new Error("error" in status && status.error ? status.error : `World nav returned ${response.status}`);
+          }
+          if (candidate !== worldNavApiUrl) {
+            setWorldNavApiUrl(candidate);
+          }
+          setWorldNavStatus(status as WorldNavStatus);
+          setWorldNavError(null);
+          return;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      setWorldNavError(lastError instanceof Error ? lastError.message : "World nav module unavailable.");
+    },
+    [worldNavApiUrl]
+  );
+  const handleMapGoal = useCallback(
+    (goal: GoalPose2D) => {
+      setGoals((current) => [...current.slice(-19), goal]);
+      if (consoleMode !== "gs") {
+        return;
+      }
+      if (!worldNavStatus?.ready) {
+        setMapStatusMessage("Goal set. World-nav is not ready yet.");
+        return;
+      }
+      if (worldNavStatus.running) {
+        setMapStatusMessage("Goal set. World-nav is already running.");
+        return;
+      }
+      setFollowRobot(true);
+      setMapStatusMessage(`Starting PointGoal to (${goal.x.toFixed(2)}, ${goal.y.toFixed(2)}).`);
+      void sendWorldNavControl({
+        command: "start_pointgoal",
+        goalLabel: `webui_click_${goal.x.toFixed(2)}_${goal.y.toFixed(2)}`,
+        goalWorld: {
+          x: goal.x,
+          y: goal.y
+        }
+      });
+    },
+    [consoleMode, sendWorldNavControl, worldNavStatus?.ready, worldNavStatus?.running]
+  );
+  const workspaceModeOptions = useMemo(
+    () => buildWorkspaceModeOptions(showAdvanced, capabilities),
+    [capabilities, showAdvanced]
+  );
+  const enabledWorkspaceModes = workspaceModeOptions
+    .filter((option) => option.enabled)
+    .map((option) => option.mode);
+  const navToolOptions = useMemo(
+    () => buildNavToolOptions(showAdvanced, capabilities, Boolean(worldNavStatus?.ready)),
+    [capabilities, showAdvanced, worldNavStatus?.ready]
+  );
+  const enabledNavTools = navToolOptions
+    .filter((option) => option.enabled)
+    .map((option) => option.tool);
 
   const mapInPlaybackRail = consoleMode === "playback" && !playbackShowcase;
+
+  useEffect(() => {
+    if (
+      !restoredInitialConsoleModeRef.current &&
+      consoleMode !== initialConsoleMode &&
+      enabledWorkspaceModes.includes(initialConsoleMode)
+    ) {
+      restoredInitialConsoleModeRef.current = true;
+      setConsoleMode(initialConsoleMode);
+      setLayers((current) => ({
+        ...current,
+        ...layerPresetForMode(initialConsoleMode)
+      }));
+      return;
+    }
+
+    if (enabledWorkspaceModes.includes(consoleMode)) {
+      return;
+    }
+    const fallbackMode = enabledWorkspaceModes[0] ?? workspaceModeOptions[0]?.mode;
+    if (fallbackMode) {
+      setConsoleMode(fallbackMode);
+    }
+  }, [consoleMode, enabledWorkspaceModes, workspaceModeOptions]);
+
+  useEffect(() => {
+    const supportedTools = new Set(enabledNavTools);
+    if (supportedTools.has(mapTool)) {
+      return;
+    }
+    const fallbackTool = enabledNavTools[0] ?? navToolOptions[0]?.tool;
+    if (fallbackTool) {
+      setMapTool(fallbackTool);
+    }
+  }, [enabledNavTools, mapTool, navToolOptions]);
+
+  useEffect(() => {
+    setLayers((current) => sanitizeLayerVisibility(current, capabilities, consoleMode, playbackShowcase));
+  }, [capabilities, consoleMode, playbackShowcase]);
 
   const renderMapWorkspacePanel = (layout: "sidebar" | "playback-rail") => {
     const miniMapClassName = layout === "playback-rail" ? "mini-map mini-map-playback-rail" : "mini-map";
     const panelContent = (
       <>
         <div className="segmented-control wrap">
-          {navTools.map(([toolKey, label]) => (
+          {navToolOptions.map(({ tool, label, enabled, reason }) => (
             <button
-              key={toolKey}
+              key={tool}
               type="button"
-              className={`segmented-option ${mapTool === toolKey ? "active" : ""}`}
-              onClick={() => setMapTool(toolKey)}
+              className={`segmented-option ${mapTool === tool ? "active" : ""}`}
+              onClick={() => setMapTool(tool)}
+              disabled={!enabled}
+              title={enabled ? label : reason}
             >
               {label}
             </button>
@@ -2917,6 +3472,7 @@ export default function App() {
           <button
             type="button"
             className="ghost-button"
+            disabled={!capabilities.canEditMap}
             onClick={() => {
               setMapExportRequestVersion((current) => current + 1);
               setMapStatusMessage("Exporting edited occupancy map...");
@@ -2930,7 +3486,9 @@ export default function App() {
             </button>
           ) : null}
         </div>
-        {consoleMode !== "playback" ? <p className="hint">{toolHint(mapTool)}</p> : null}
+        {consoleMode !== "playback" ? (
+          <p className="hint">{toolHint(mapTool, navGoalTopicName, initialPoseTopicName, Boolean(worldNavStatus?.ready))}</p>
+        ) : null}
         {consoleMode !== "playback" ? (
           <>
             <div className="control-group">
@@ -3000,6 +3558,7 @@ export default function App() {
           <TopDownMap
             manifest={manifest}
             ros={rosState.ros}
+            liveContract={liveContract}
             streamProfile={rosState.streamProfile}
             robotPose={displayRobotPose}
             trajectory={displayTrajectory}
@@ -3014,7 +3573,7 @@ export default function App() {
             selectedTool={mapTool}
             followRobot={effectiveFollowRobot}
             exportRequestVersion={mapExportRequestVersion}
-            onGoal={(goal) => setGoals((current) => [...current.slice(-19), goal])}
+            onGoal={handleMapGoal}
             onPlannedPath={setPlannedPath}
             onPlanningState={(status, reason) => {
               setPlannerStatus(status);
@@ -3090,14 +3649,16 @@ export default function App() {
               <div className="mode-cluster">
                 <span className="mode-label">Workspace</span>
                 <div className="segmented-control">
-                {workspaceModes.map((modeOption) => (
+                {workspaceModeOptions.map(({ mode, enabled, reason }) => (
                   <button
-                    key={modeOption}
+                    key={mode}
                     type="button"
-                    className={`segmented-option ${consoleMode === modeOption ? "active" : ""}`}
-                    onClick={() => applyConsoleMode(modeOption)}
+                    className={`segmented-option ${consoleMode === mode ? "active" : ""}`}
+                    onClick={() => applyConsoleMode(mode)}
+                    disabled={!enabled}
+                    title={enabled ? titleCase(mode) : reason}
                   >
-                    {titleCase(modeOption)}
+                    {titleCase(mode)}
                   </button>
                 ))}
               </div>
@@ -3113,6 +3674,17 @@ export default function App() {
         <div className="topbar-side">
           <div className={`status-chip ${rosState.connectionState}`}>ROS {rosState.connectionState}</div>
           <div className="status-chip neutral">Scene {manifest?.training?.status ?? "loading"}</div>
+          {externalViewer ? (
+            <a
+              className="external-viewer-link"
+              href={externalViewer.url}
+              target="_blank"
+              rel="noreferrer"
+              title={externalViewer.notes ?? externalViewer.url}
+            >
+              {externalViewer.label ?? "Open External Viewer"}
+            </a>
+          ) : null}
           <button
             type="button"
             className="link-button"
@@ -3147,6 +3719,10 @@ export default function App() {
                   </label>
                 </>
               ) : null}
+              <label className="endpoint">
+                <span>world-nav</span>
+                <input value={worldNavApiUrl} onChange={(event) => setWorldNavApiUrl(event.target.value)} />
+              </label>
             </>
           ) : null}
         </div>
@@ -3293,31 +3869,54 @@ export default function App() {
               </section>
             </>
           ) : (
-          <div className={`viewer-stage ${consoleMode === "hifi" && hifiNativeRendererReady ? "hifi-stage" : ""} ${playbackShowcase ? "showcase-stage" : ""}`}>
+          <div
+            className={`viewer-stage ${consoleMode === "hifi" ? "hifi-stage" : ""} ${
+              showExternalFrameStage ? "external-frame-stage" : ""
+            } ${playbackShowcase ? "showcase-stage" : ""}`}
+          >
             {consoleMode === "playback" && playbackShowcase ? (
               <div className="playback-hidden-master-video" aria-hidden="true">
                 {renderPlaybackMasterVideo("compare-video playback-master-video-hidden")}
               </div>
             ) : null}
-            {consoleMode === "hifi" && hifiNativeRendererReady ? (
+            {consoleMode === "hifi" ? (
               <NativeRenderStage
                 key={`native-stage:${mediaSessionKey}`}
                 streamUrl={hifiVideoStreamUrl}
                 frameUrl={hifiFrameUrl}
                 previewFrameUrl={hifiPreviewFrameUrl}
+                label="Native GS-SDF render"
                 interactive={hifiInteractive}
                 usingNativeWindow={hifiUsingNativeWindow}
                 status={hifiStatus}
                 windowStatus={hifiWindowStatus}
                 error={hifiError}
                 streamFailed={hifiStreamFailed}
+                preferFramePolling
                 onStreamFailed={() => setHifiStreamFailed(true)}
+              />
+            ) : null}
+            {showExternalFrameStage ? (
+              <NativeRenderStage
+                key={`external-frame-stage:${mediaSessionKey}`}
+                streamUrl={null}
+                frameUrl={externalViewerFrameUrl}
+                previewFrameUrl={externalViewerFrameUrl}
+                label={externalViewer?.label ?? "External HTTP viewer"}
+                interactive={false}
+                usingNativeWindow={false}
+                status={null}
+                windowStatus={null}
+                error={null}
+                streamFailed={false}
+                preferFramePolling
+                onStreamFailed={() => undefined}
               />
             ) : null}
             <canvas
               key={`viewer-canvas-main:${mediaSessionKey}`}
               ref={setMainCanvasRef}
-              className={`main-canvas ${consoleMode === "hifi" && hifiNativeRendererReady ? "remote-control-canvas" : ""}`}
+              className={`main-canvas ${consoleMode === "hifi" ? "remote-control-canvas" : ""}`}
             />
             <div className="viewer-overlay top-left">
               <div className="overlay-card">
@@ -3338,6 +3937,8 @@ export default function App() {
                     ? occupancyCloudAssetState === "fallback"
                       ? "Fallback occupancy cloud + geometry overlays. Left drag rotates, middle drag pans, wheel zooms."
                       : "RViz-style working mode. Left drag rotates, middle drag pans, wheel zooms."
+                    : hasExternalViewer
+                      ? "External reconstruction baseline is linked in the header. The local viewport remains available for imported GLB/PLY scene packs."
                     : gsControlMode === "fps"
                       ? "Photoreal review mode. Click viewport to lock mouse, then use WASD on the ground plane and Q/E for height."
                       : "Photoreal review mode. Left drag rotates, middle drag pans, wheel zooms."}
@@ -3408,7 +4009,9 @@ export default function App() {
                   emptyMessage="Waiting for rendered reference frame"
                 />
                 <p className="hint">
-                  Compare the current 3D view against the re-rendered output from `/rviz/current_camera_pose`.
+                  {cameraPoseTopicName
+                    ? `Compare the current 3D view against the re-rendered output from ${cameraPoseTopicName}.`
+                    : "Camera pose publishing is disabled by the live contract."}
                 </p>
               </section>
 
@@ -3601,6 +4204,100 @@ export default function App() {
         <aside className="sidebar">
           {!mapInPlaybackRail ? renderMapWorkspacePanel("sidebar") : null}
 
+          <InspectorSection
+            title="World Navigation"
+            note={worldNavStatus?.running ? "running" : worldNavStatus?.ready ? "ready" : "offline"}
+            defaultOpen
+          >
+            <div className="control-stack">
+              <div className="kv-list compact">
+                <div>
+                  <span>Module</span>
+                  <strong>{worldNavError ? "error" : worldNavStatus?.ready ? "ready" : "waiting"}</strong>
+                </div>
+                <div>
+                  <span>Task</span>
+                  <strong>
+                    {worldNavStatus?.currentTask?.semanticGoal ??
+                      worldNavStatus?.currentTask?.goalLabel ??
+                      worldNavStatus?.currentTask?.command ??
+                      "idle"}
+                  </strong>
+                </div>
+                <div>
+                  <span>Last result</span>
+                  <strong>
+                    {worldNavStatus?.lastReport?.episodes?.at(-1)?.result ??
+                      (worldNavStatus?.running ? "running" : "none")}
+                  </strong>
+                </div>
+              </div>
+
+              {worldNavError ? <p className="error-line">{worldNavError}</p> : null}
+
+              <div className="control-group">
+                <span className="control-label">Semantic goal</span>
+                <select
+                  className="compact-select"
+                  value={selectedSemanticGoal}
+                  disabled={!worldNavStatus?.semanticGoals?.length || worldNavStatus?.running}
+                  onChange={(event) => setSelectedSemanticGoal(event.target.value)}
+                >
+                  {(worldNavStatus?.semanticGoals ?? []).map((goal) => (
+                    <option key={goal.label} value={goal.label}>
+                      {goal.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="segmented-control wrap">
+                <button
+                  type="button"
+                  className="segmented-option"
+                  disabled={!worldNavStatus?.ready || worldNavStatus?.running || !selectedSemanticGoal}
+                  onClick={() =>
+                    void sendWorldNavControl({
+                      command: "start_semantic",
+                      semanticGoal: selectedSemanticGoal
+                    })
+                  }
+                >
+                  Run Semantic
+                </button>
+                <button
+                  type="button"
+                  className="segmented-option"
+                  disabled={!worldNavStatus?.ready || worldNavStatus?.running}
+                  onClick={() =>
+                    void sendWorldNavControl(
+                      latestPointGoal
+                        ? {
+                            command: "start_pointgoal",
+                            goalLabel: `webui_click_${latestPointGoal.x.toFixed(2)}_${latestPointGoal.y.toFixed(2)}`,
+                            goalWorld: {
+                              x: latestPointGoal.x,
+                              y: latestPointGoal.y
+                            }
+                          }
+                        : { command: "start_pointgoal" }
+                    )
+                  }
+                >
+                  Run PointGoal
+                </button>
+                <button
+                  type="button"
+                  className="segmented-option"
+                  disabled={!worldNavStatus?.running}
+                  onClick={() => void sendWorldNavControl({ command: "stop" })}
+                >
+                  Stop
+                </button>
+              </div>
+            </div>
+          </InspectorSection>
+
           {consoleMode !== "compare" && consoleMode !== "playback" && consoleMode !== "hifi" && showAdvanced ? (
             <InspectorSection title="Camera Feeds" note="rendered from web camera pose" defaultOpen={false}>
               <div className="feed-grid">
@@ -3608,7 +4305,9 @@ export default function App() {
                 <CameraFeed title="Depth" frame={rosState.depthFrame} />
               </div>
               <p className="hint">
-                These feeds render from the current Web camera pose through `/rviz/current_camera_pose`.
+                {cameraPoseTopicName
+                  ? `These feeds render from the current Web camera pose through ${cameraPoseTopicName}.`
+                  : "Camera pose publishing is disabled by the live contract."}
               </p>
             </InspectorSection>
           ) : null}
@@ -3640,6 +4339,8 @@ export default function App() {
                   <input
                     type="checkbox"
                     checked={layers[key]}
+                    disabled={!layerAvailability[key].enabled}
+                    title={layerAvailability[key].reason}
                     onChange={(event) =>
                       setLayers((current) => ({
                         ...current,
@@ -3649,14 +4350,16 @@ export default function App() {
                   />
                   <span>{label}</span>
                   <span className="asset-state">
-                    {layerAssetState(
-                      key,
-                      manifest,
-                      hasLiveCloud,
-                      consoleMode,
-                      displayRobotPose,
-                      displayTrajectory.length
-                    )}
+                    {layerAvailability[key].enabled
+                      ? layerAssetState(
+                          key,
+                          sceneManifest,
+                          hasLiveCloud,
+                          consoleMode,
+                          displayRobotPose,
+                          displayTrajectory.length
+                        )
+                      : layerAvailability[key].reason ?? "unsupported"}
                   </span>
                 </label>
               ))}
@@ -3673,6 +4376,8 @@ export default function App() {
                           key={key}
                           type="button"
                           className={`segmented-option ${activeGaussianVariant === key ? "active" : ""}`}
+                          disabled={!layerAvailability.gaussian.enabled}
+                          title={layerAvailability.gaussian.reason}
                           onClick={() => setGaussianVariant(key)}
                         >
                           {source.label ?? titleCase(key)}
@@ -3734,6 +4439,8 @@ export default function App() {
               defaultOpen={false}
             >
               {sceneError ? <p className="error-line">{sceneError}</p> : null}
+              {liveContractError ? <p className="error-line">{liveContractError}</p> : null}
+              {capabilityMatrixError ? <p className="error-line">{capabilityMatrixError}</p> : null}
               {rosState.errorMessage ? <p className="error-line">{rosState.errorMessage}</p> : null}
               <div className="kv-list">
                 <div>
@@ -3747,6 +4454,34 @@ export default function App() {
                 <div>
                   <span>Main 3D source</span>
                   <strong>{mainViewSource}</strong>
+                </div>
+                <div>
+                  <span>Live contract</span>
+                  <strong>{liveContract?.contractId ?? "builtin-fallback"}</strong>
+                </div>
+                <div>
+                  <span>Capability matrix</span>
+                  <strong>{capabilityMatrix?.matrixId ?? "inferred-fallback"}</strong>
+                </div>
+                <div>
+                  <span>Adapter</span>
+                  <strong>{adapterCapability?.displayName ?? manifest?.source?.kind ?? "unknown"}</strong>
+                </div>
+                <div>
+                  <span>Integration mode</span>
+                  <strong>{adapterCapability?.integrationMode ?? "inferred"}</strong>
+                </div>
+                <div>
+                  <span>External viewer</span>
+                  <strong>{externalViewer?.url ?? "disabled"}</strong>
+                </div>
+                <div>
+                  <span>Goal topic</span>
+                  <strong>{navGoalTopicName ?? "disabled"}</strong>
+                </div>
+                <div>
+                  <span>Camera pose topic</span>
+                  <strong>{cameraPoseTopicName ?? "disabled"}</strong>
                 </div>
                 <div>
                   <span>Trajectory points</span>
@@ -3796,15 +4531,15 @@ export default function App() {
                 </div>
                 <div>
                   <span>Gaussian asset</span>
-                  <strong>{manifest?.assets?.gaussian ?? "loading"}</strong>
+                  <strong>{sceneManifest?.assets?.gaussian ?? "loading"}</strong>
                 </div>
                 <div>
                   <span>Gaussian SH</span>
-                  <strong>{effectiveManifest?.gaussian?.shDegree ?? manifest?.gaussian?.shDegree ?? "n/a"}</strong>
+                  <strong>{effectiveManifest?.gaussian?.shDegree ?? sceneManifest?.gaussian?.shDegree ?? "n/a"}</strong>
                 </div>
                 <div>
                   <span>Occupancy/static cloud asset</span>
-                  <strong>{manifest?.assets?.rawPointCloud ?? "loading"}</strong>
+                  <strong>{sceneManifest?.assets?.rawPointCloud ?? "loading"}</strong>
                 </div>
                 <div>
                   <span>Live playback cloud</span>
@@ -3857,6 +4592,448 @@ function resolveGaussianVariant(manifest: SceneManifest | null, variant: string 
     ...manifest,
     gaussian: manifest.gaussianVariants[variant]
   };
+}
+
+function extractGaussianManifestPatch(raw: unknown): Partial<SceneManifest> | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const payload = raw as Record<string, unknown>;
+  const patch: Partial<SceneManifest> = {};
+
+  if (payload.gaussian && typeof payload.gaussian === "object" && !Array.isArray(payload.gaussian)) {
+    patch.gaussian = payload.gaussian as GaussianSource;
+  }
+  if (payload.gaussianVariants && typeof payload.gaussianVariants === "object" && !Array.isArray(payload.gaussianVariants)) {
+    patch.gaussianVariants = payload.gaussianVariants as Record<string, GaussianSource>;
+  }
+  if (payload.assets && typeof payload.assets === "object" && !Array.isArray(payload.assets)) {
+    patch.assets = payload.assets as Record<string, string>;
+  }
+
+  return Object.keys(patch).length > 0 ? patch : null;
+}
+
+function mergeSceneManifest(
+  manifest: SceneManifest | null,
+  patch: Partial<SceneManifest> | null
+): SceneManifest | null {
+  if (!manifest) {
+    return null;
+  }
+  if (!patch) {
+    return manifest;
+  }
+  if (manifest.source?.liveGaussianPatchMode === "disabled") {
+    return manifest;
+  }
+  let resolvedPatch = patch;
+  if (manifest.source?.liveGaussianPatchMode === "fallback" && (manifest.gaussian || manifest.gaussianVariants)) {
+    const { gaussian: _gaussian, gaussianVariants: _gaussianVariants, ...restPatch } = patch;
+    resolvedPatch = {
+      ...restPatch,
+      assets: {
+        ...(patch.assets ?? {}),
+        gaussian: manifest.assets?.gaussian ?? "ready"
+      }
+    };
+  }
+  if (manifest.source?.liveGaussianPatchMode === "replace" && patch.gaussian && !patch.gaussianVariants) {
+    resolvedPatch = {
+      ...patch,
+      gaussianVariants: undefined
+    };
+  }
+
+  return {
+    ...manifest,
+    ...resolvedPatch,
+    assets: {
+      ...(manifest.assets ?? {}),
+      ...(resolvedPatch.assets ?? {})
+    }
+  };
+}
+
+async function hydrateSceneManifestVisualLayer(manifest: SceneManifest, manifestUrl: string): Promise<SceneManifest> {
+  const visualManifestUrl = manifest.source?.visualManifestUrl;
+  if (!visualManifestUrl) {
+    return manifest;
+  }
+
+  const resolvedUrl = resolveLiveContractUrl(visualManifestUrl, manifestUrl || window.location.href);
+  const response = await fetch(resolvedUrl, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`Failed to load visual manifest: ${response.status}`);
+  }
+  const visualManifest = (await response.json()) as SceneManifest;
+  const assets = {
+    ...(visualManifest.assets ?? {}),
+    ...(manifest.assets ?? {})
+  };
+  if (!assets.gaussian && visualManifest.gaussian) {
+    assets.gaussian = "ready";
+  }
+  return {
+    ...manifest,
+    camera: manifest.camera ?? visualManifest.camera,
+    initialView: manifest.initialView ?? visualManifest.initialView,
+    gaussian: manifest.gaussian ?? visualManifest.gaussian,
+    gaussianVariants: manifest.gaussianVariants ?? visualManifest.gaussianVariants,
+    mesh: manifest.mesh ?? visualManifest.mesh,
+    rawPointCloud: manifest.rawPointCloud ?? visualManifest.rawPointCloud,
+    occupancy: manifest.occupancy ?? visualManifest.occupancy,
+    robot: manifest.robot ?? visualManifest.robot,
+    meta: manifest.meta ?? visualManifest.meta,
+    assets
+  };
+}
+
+function buildSceneInitialViewKey(manifest: SceneManifest | null): string | null {
+  if (!manifest?.initialView) {
+    return null;
+  }
+
+  return JSON.stringify({
+    sceneId: manifest.sceneId,
+    pose: manifest.initialView.pose,
+    target: manifest.initialView.target ?? null
+  });
+}
+
+interface UiCapabilities {
+  supportsPlayback: boolean;
+  supportsLive: boolean;
+  supportsGaussian: boolean;
+  supportsMesh: boolean;
+  supportsOccupancy: boolean;
+  supportsRawPointCloud: boolean;
+  supportsTrajectory: boolean;
+  supportsRobot: boolean;
+  supportsRgb: boolean;
+  supportsDepth: boolean;
+  canUsePlayback: boolean;
+  canUseLive: boolean;
+  canUseGs: boolean;
+  canUseHiFi: boolean;
+  canUseCompare: boolean;
+  canPublishGoal: boolean;
+  canPublishInitialPose: boolean;
+  canPublishCameraPose: boolean;
+  canEditMap: boolean;
+}
+
+interface ModeOption {
+  mode: ConsoleMode;
+  enabled: boolean;
+  reason?: string;
+}
+
+interface ToolOption {
+  tool: MapTool;
+  label: string;
+  enabled: boolean;
+  reason?: string;
+}
+
+interface LayerAvailabilityEntry {
+  enabled: boolean;
+  reason?: string;
+}
+
+type LayerAvailability = Record<keyof LayerVisibility, LayerAvailabilityEntry>;
+
+function deriveUiCapabilities(
+  adapter: AdapterCapability | null,
+  manifest: SceneManifest | null,
+  topics: {
+    navGoalTopicName: string | null;
+    initialPoseTopicName: string | null;
+    cameraPoseTopicName: string | null;
+  }
+): UiCapabilities {
+  const hasGaussian = Boolean(manifest?.gaussian);
+  const hasMesh = Boolean(manifest?.mesh);
+  const hasOccupancy = Boolean(manifest?.occupancy);
+  const hasRawPointCloud = Boolean(manifest?.rawPointCloud);
+  const hasExternalViewer = Boolean(manifest?.externalViewer?.url);
+  const hasMapMeta = Boolean(manifest?.meta?.leafSize && manifest?.meta?.mapSize && manifest?.meta?.mapOrigin);
+  const hasAnySceneAsset = hasGaussian || hasMesh || hasOccupancy || hasRawPointCloud || hasExternalViewer;
+
+  const supportsPlayback = adapter
+    ? adapterSupportsLiveProfile(adapter, "playback") ||
+      adapterSupportsInboundChannel(adapter, "playback_odometry") ||
+      adapterSupportsInboundChannel(adapter, "playback_scan_body") ||
+      adapterSupportsInboundChannel(adapter, "playback_global_map")
+    : true;
+  const supportsLive = adapter
+    ? adapterSupportsLiveProfile(adapter, "neural") ||
+      adapterSupportsInboundChannel(adapter, "robot_pose") ||
+      adapterSupportsInboundChannel(adapter, "live_point_cloud") ||
+      adapterSupportsInboundChannel(adapter, "trajectory")
+    : true;
+  const supportsGaussian = hasGaussian || adapterSupportsArtifact(adapter, "gaussian");
+  const supportsMesh = hasMesh || adapterSupportsArtifact(adapter, "mesh");
+  const supportsOccupancy = hasOccupancy || adapterSupportsArtifact(adapter, "occupancy");
+  const supportsRawPointCloud = hasRawPointCloud || adapterSupportsArtifact(adapter, "rawPointCloud");
+  const supportsTrajectory =
+    adapter == null
+      ? true
+      : adapterSupportsArtifact(adapter, "trajectory") ||
+        adapterSupportsInboundChannel(adapter, "trajectory") ||
+        adapterSupportsInboundChannel(adapter, "playback_odometry");
+  const supportsRobot =
+    adapter == null
+      ? true
+      : adapterSupportsInboundChannel(adapter, "robot_pose") ||
+        adapterSupportsInboundChannel(adapter, "playback_odometry");
+  const supportsRgb =
+    adapter == null
+      ? true
+      : adapterSupportsArtifact(adapter, "rgb") ||
+        adapterSupportsInboundChannel(adapter, "rgb_frame") ||
+        adapterSupportsInboundChannel(adapter, "playback_rgb");
+  const supportsDepth =
+    adapter == null
+      ? true
+      : adapterSupportsArtifact(adapter, "depth") || adapterSupportsInboundChannel(adapter, "depth_frame");
+  const supportsExternalViewer =
+    adapter == null
+      ? hasExternalViewer
+      : adapterSupportsArtifact(adapter, "externalViewer") || adapterSupportsInboundChannel(adapter, "external_viewer");
+
+  const canPublishGoal =
+    Boolean(topics.navGoalTopicName) &&
+    (adapter == null
+      ? true
+      : adapter.navigation?.publishGoal !== false &&
+        adapterSupportsOutboundChannel(adapter, "nav_goal"));
+  const canPublishInitialPose =
+    Boolean(topics.initialPoseTopicName) &&
+    (adapter == null
+      ? true
+      : adapter.navigation?.publishInitialPose !== false &&
+        adapterSupportsOutboundChannel(adapter, "initial_pose"));
+  const canPublishCameraPose =
+    Boolean(topics.cameraPoseTopicName) &&
+    (adapter == null
+      ? true
+      : adapter.navigation?.publishCameraPose !== false &&
+        adapterSupportsOutboundChannel(adapter, "camera_pose"));
+
+  return {
+    supportsPlayback,
+    supportsLive,
+    supportsGaussian,
+    supportsMesh,
+    supportsOccupancy,
+    supportsRawPointCloud,
+    supportsTrajectory,
+    supportsRobot,
+    supportsRgb,
+    supportsDepth,
+    canUsePlayback: supportsPlayback,
+    canUseLive: supportsLive,
+    canUseGs:
+      hasAnySceneAsset || supportsGaussian || supportsMesh || supportsRawPointCloud || supportsOccupancy || supportsExternalViewer,
+    canUseHiFi: hasGaussian || supportsGaussian || hasMesh || hasExternalViewer || supportsExternalViewer,
+    canUseCompare: canPublishCameraPose && (supportsRgb || supportsDepth || hasGaussian || hasMesh),
+    canPublishGoal,
+    canPublishInitialPose,
+    canPublishCameraPose,
+    canEditMap: hasMapMeta || hasOccupancy || hasRawPointCloud || supportsPlayback || supportsLive
+  };
+}
+
+function buildWorkspaceModeOptions(showAdvanced: boolean, capabilities: UiCapabilities): ModeOption[] {
+  const modes: ConsoleMode[] = showAdvanced
+    ? ["playback", "live", "gs", "hifi", "compare"]
+    : ["playback", "live", "gs", "hifi"];
+
+  return modes.map((mode) => {
+    switch (mode) {
+      case "playback":
+        return {
+          mode,
+          enabled: capabilities.canUsePlayback,
+          reason: capabilities.canUsePlayback ? undefined : "Adapter has no playback profile."
+        };
+      case "live":
+        return {
+          mode,
+          enabled: capabilities.canUseLive,
+          reason: capabilities.canUseLive ? undefined : "Adapter has no live profile."
+        };
+      case "gs":
+        return {
+          mode,
+          enabled: capabilities.canUseGs,
+          reason: capabilities.canUseGs ? undefined : "Scene has no compatible geometry assets."
+        };
+      case "hifi":
+        return {
+          mode,
+          enabled: capabilities.canUseHiFi,
+          reason: capabilities.canUseHiFi ? undefined : "High-fidelity review requires gaussian or mesh geometry."
+        };
+      case "compare":
+        return {
+          mode,
+          enabled: capabilities.canUseCompare,
+          reason: capabilities.canUseCompare
+            ? undefined
+            : "Compare mode needs camera-pose publishing plus RGB or depth support."
+        };
+      default:
+        return { mode, enabled: true };
+    }
+  });
+}
+
+function buildNavToolOptions(showAdvanced: boolean, capabilities: UiCapabilities, worldNavReady: boolean): ToolOption[] {
+  const canSendPointGoal = capabilities.canPublishGoal || worldNavReady;
+  const tools: ToolOption[] = showAdvanced
+    ? [
+        { tool: "goal", label: "Goal", enabled: canSendPointGoal, reason: "Goal publishing is unavailable." },
+        {
+          tool: "initialPose",
+          label: "Initial Pose",
+          enabled: capabilities.canPublishInitialPose,
+          reason: "Initial-pose publishing is unavailable."
+        },
+        { tool: "measure", label: "Measure", enabled: true },
+        { tool: "obstacle", label: "Obstacle", enabled: capabilities.canEditMap, reason: "Map editing is unavailable." },
+        { tool: "erase", label: "Erase", enabled: capabilities.canEditMap, reason: "Map editing is unavailable." }
+      ]
+    : [
+        { tool: "goal", label: "Goal", enabled: canSendPointGoal, reason: "Goal publishing is unavailable." },
+        {
+          tool: "initialPose",
+          label: "Initial Pose",
+          enabled: capabilities.canPublishInitialPose,
+          reason: "Initial-pose publishing is unavailable."
+        },
+        { tool: "obstacle", label: "Obstacle", enabled: capabilities.canEditMap, reason: "Map editing is unavailable." },
+        { tool: "erase", label: "Erase", enabled: capabilities.canEditMap, reason: "Map editing is unavailable." }
+      ];
+
+  return tools;
+}
+
+function deriveLayerAvailability(
+  capabilities: UiCapabilities,
+  manifest: SceneManifest | null,
+  consoleMode: ConsoleMode,
+  hasLiveCloud: boolean,
+  robotPose: Pose3D | null,
+  trajectoryCount: number
+): LayerAvailability {
+  const hasStaticCloud = Boolean(manifest?.rawPointCloud || manifest?.occupancy);
+  const gaussianEnabled = Boolean(manifest?.gaussian) && capabilities.supportsGaussian;
+  const meshEnabled = Boolean(manifest?.mesh) && capabilities.supportsMesh;
+  const occupancyEnabled =
+    consoleMode === "playback"
+      ? capabilities.canUsePlayback
+      : hasStaticCloud || capabilities.supportsRawPointCloud || capabilities.supportsOccupancy;
+  const liveEnabled = consoleMode === "playback" ? capabilities.canUsePlayback : capabilities.canUseLive;
+  const trajectoryEnabled = trajectoryCount > 0 || capabilities.supportsTrajectory;
+  const robotEnabled = Boolean(robotPose) || capabilities.supportsRobot;
+  return {
+    gaussian: {
+      enabled: gaussianEnabled,
+      reason: gaussianEnabled
+        ? undefined
+        : manifest?.gaussian
+          ? "Gaussian layer unavailable."
+          : "No gaussian asset in this scene."
+    },
+    sdfMesh: {
+      enabled: meshEnabled,
+      reason: meshEnabled
+        ? undefined
+        : manifest?.mesh
+          ? "Mesh layer unavailable."
+          : "No mesh asset in this scene."
+    },
+    occupancyCloud: {
+      enabled: occupancyEnabled,
+      reason: occupancyEnabled
+        ? undefined
+        : consoleMode === "playback"
+          ? "Playback map cloud is unavailable."
+          : "No occupancy or static cloud asset is available."
+    },
+    liveCloud: {
+      enabled: liveEnabled,
+      reason: liveEnabled
+        ? undefined
+        : consoleMode === "playback"
+          ? "Playback scan feed is unavailable."
+          : "Live point-cloud feed is unavailable."
+    },
+    trajectory: {
+      enabled: trajectoryEnabled,
+      reason: trajectoryEnabled ? undefined : "Trajectory data is unavailable."
+    },
+    robot: {
+      enabled: robotEnabled,
+      reason: robotEnabled ? undefined : "Robot pose is unavailable."
+    }
+  };
+}
+
+function sanitizeLayerVisibility(
+  current: LayerVisibility,
+  capabilities: UiCapabilities,
+  consoleMode: ConsoleMode,
+  playbackShowcase: boolean
+): LayerVisibility {
+  const next = { ...current };
+  if (playbackShowcase) {
+    next.gaussian = false;
+    next.sdfMesh = false;
+  }
+  if (!capabilities.supportsGaussian || !capabilities.canUseGs) {
+    next.gaussian = false;
+  }
+  if (!capabilities.supportsMesh && consoleMode !== "hifi") {
+    next.sdfMesh = false;
+  }
+  if (!capabilities.canUseLive && consoleMode !== "playback") {
+    next.liveCloud = false;
+  }
+  if (!capabilities.canUsePlayback && consoleMode === "playback") {
+    next.occupancyCloud = false;
+    next.liveCloud = false;
+  }
+  if (!capabilities.supportsTrajectory) {
+    next.trajectory = false;
+  }
+  if (!capabilities.supportsRobot) {
+    next.robot = false;
+  }
+  return next;
+}
+
+function sanitizeLayerVisibilityWithAvailability(
+  current: LayerVisibility,
+  availability: LayerAvailability,
+  _consoleMode: ConsoleMode,
+  playbackShowcase: boolean
+): LayerVisibility {
+  const next = { ...current };
+  if (playbackShowcase) {
+    next.gaussian = false;
+    next.sdfMesh = false;
+  }
+
+  for (const key of Object.keys(availability) as Array<keyof LayerVisibility>) {
+    if (!availability[key].enabled) {
+      next[key] = false;
+    }
+  }
+
+  return next;
 }
 
 function layerPresetForMode(mode: ConsoleMode): LayerVisibility {
@@ -3936,7 +5113,8 @@ function describeWorkspaceSemantic(
   viewerMode: ViewerMode,
   rawAssetState: string,
   streamProfile: "idle" | "neural" | "playback",
-  hifiBrowserFallbackActive = false
+  hifiBrowserFallbackActive = false,
+  hasExternalViewer = false
 ) {
   if (consoleMode === "playback") {
     return {
@@ -3968,6 +5146,14 @@ function describeWorkspaceSemantic(
   }
 
   if (viewerMode === "gs") {
+    if (hasExternalViewer) {
+      return {
+        title: "External baseline",
+        detail: "Linked viewer for non-gaussian reconstruction output",
+        badge: "External"
+      };
+    }
+
     return {
       title: "GS review",
       detail: "Photoreal gaussian inspection and walkthrough",
@@ -3986,7 +5172,14 @@ function describeDataSemantic(
   connectionState: string,
   streamProfile: "idle" | "neural" | "playback",
   livePointCloud: { renderedPointCount: number } | null,
-  rawAssetState: string
+  rawAssetState: string,
+  topics: {
+    playbackGlobalMapTopicName: string | null;
+    playbackCurrentScanWorldTopicName: string | null;
+    playbackRgbTopicName: string | null;
+  },
+  adapterName?: string,
+  hasExternalViewer = false
 ) {
   if (connectionState === "connected" && streamProfile === "playback" && livePointCloud) {
     return {
@@ -3996,9 +5189,16 @@ function describeDataSemantic(
   }
 
   if (connectionState === "connected" && streamProfile === "playback") {
+    const expectedTopics = [
+      topics.playbackGlobalMapTopicName,
+      topics.playbackCurrentScanWorldTopicName,
+      topics.playbackRgbTopicName
+    ]
+      .filter(Boolean)
+      .join(", ");
     return {
       title: "Playback connected",
-      detail: "Waiting for /fastlivo/global_map, /fastlivo/current_scan_world, and /origin_img"
+      detail: expectedTopics ? `Waiting for ${expectedTopics}` : "Waiting for playback topics"
     };
   }
 
@@ -4023,6 +5223,13 @@ function describeDataSemantic(
     };
   }
 
+  if (hasExternalViewer) {
+    return {
+      title: adapterName ?? "External viewer",
+      detail: "Viser or external HTTP viewer, not ROS topic streaming"
+    };
+  }
+
   return {
     title: "Scene only",
     detail: "Static assets loaded without active live topic flow"
@@ -4034,7 +5241,8 @@ function describeRenderSemantic(
   viewerMode: ViewerMode,
   gaussianVariant: string,
   gsControlMode: GsControlMode,
-  hifiBrowserFallbackActive = false
+  hifiBrowserFallbackActive = false,
+  hasExternalViewer = false
 ) {
   if (consoleMode === "playback") {
     return {
@@ -4058,6 +5266,13 @@ function describeRenderSemantic(
     return {
       title: "Geometry-first",
       detail: "Orbit / pan for mapping and nav overlays"
+    };
+  }
+
+  if (hasExternalViewer) {
+    return {
+      title: "External HTTP viewer",
+      detail: "LingBot-Map viser output is opened outside the Spark gaussian renderer"
     };
   }
 
@@ -4097,12 +5312,26 @@ function layerAssetState(
   }
 }
 
-function toolHint(tool: MapTool): string {
+function toolHint(
+  tool: MapTool,
+  navGoalTopicName: string | null,
+  initialPoseTopicName: string | null,
+  worldNavReady: boolean
+): string {
   switch (tool) {
     case "goal":
-      return "Click to publish /move_base_simple/goal.";
+      if (worldNavReady) {
+        return navGoalTopicName
+          ? `Click a free cell to send a PointGoal; ROS topic ${navGoalTopicName} is also published when available.`
+          : "Click a free cell to send a PointGoal through the world-nav/Nav2 backend.";
+      }
+      return navGoalTopicName
+        ? `Click to publish ${navGoalTopicName}.`
+        : "Goal publishing is disabled by the live contract.";
     case "initialPose":
-      return "Click to publish /initialpose for localization reset.";
+      return initialPoseTopicName
+        ? `Click to publish ${initialPoseTopicName} for localization reset.`
+        : "Initial pose publishing is disabled by the live contract.";
     case "measure":
       return "Drag to measure planar distance on the occupancy grid.";
     case "obstacle":
@@ -5013,34 +6242,37 @@ function NativeRenderStage(props: {
   streamUrl: string | null;
   frameUrl: string | null;
   previewFrameUrl: string | null;
+  label?: string;
   interactive: boolean;
   usingNativeWindow: boolean;
   status: HiFiStatus | null;
   windowStatus: HiFiWindowStatus | null;
   error: string | null;
   streamFailed: boolean;
+  preferFramePolling?: boolean;
   onStreamFailed(): void;
 }) {
   const {
     streamUrl,
     frameUrl,
     previewFrameUrl,
+    label = "Native GS-SDF render stream",
     interactive,
     usingNativeWindow,
     status,
     windowStatus,
     error,
     streamFailed,
+    preferFramePolling = false,
     onStreamFailed
   } = props;
   const [displayUrl, setDisplayUrl] = useState<string | null>(null);
   const [frameError, setFrameError] = useState<string | null>(null);
   const [streamError, setStreamError] = useState<string | null>(null);
-  const [streamLoaded, setStreamLoaded] = useState(false);
-  const [streamTimedOut, setStreamTimedOut] = useState(false);
   const objectUrlRef = useRef<string | null>(null);
-  const useStream = Boolean(streamUrl) && usingNativeWindow && !streamFailed && !streamError;
-  const ready = (useStream || Boolean(frameUrl)) && !streamFailed;
+  const activeFrameUrl = interactive && previewFrameUrl ? previewFrameUrl : frameUrl;
+  const useStream = Boolean(streamUrl) && !preferFramePolling && !streamFailed && !streamError;
+  const ready = (useStream || Boolean(activeFrameUrl)) && !streamFailed;
   const statusLabel = error
     ? `HiFi bridge error: ${error}`
     : streamError
@@ -5055,29 +6287,14 @@ function NativeRenderStage(props: {
         }`
       : windowStatus?.lastError
         ? `${windowStatus.lastError}. Falling back to renderer stream.`
-      : "Waiting for native GS-SDF render stream";
-  const activeFrameUrl = interactive && previewFrameUrl ? previewFrameUrl : frameUrl;
-
+      : `Waiting for ${label}`;
   useEffect(() => {
     setFrameError(null);
   }, [frameUrl, previewFrameUrl, interactive]);
 
   useEffect(() => {
     setStreamError(null);
-    setStreamLoaded(false);
-    setStreamTimedOut(false);
   }, [streamUrl, usingNativeWindow]);
-
-  useEffect(() => {
-    if (!useStream || streamLoaded) {
-      return;
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      setStreamTimedOut(true);
-    }, 1200);
-    return () => window.clearTimeout(timeoutId);
-  }, [streamLoaded, useStream]);
 
   useEffect(() => {
     if (useStream || !activeFrameUrl || streamFailed) {
@@ -5162,14 +6379,12 @@ function NativeRenderStage(props: {
 
   return (
     <div className="main-remote-surface">
-      {useStream && !streamTimedOut ? (
+      {useStream ? (
         <img
           className="main-remote-stream"
           src={streamUrl ?? undefined}
-          alt="Native GS-SDF render stream"
+          alt={label}
           onLoad={() => {
-            setStreamLoaded(true);
-            setStreamTimedOut(false);
             setFrameError(null);
           }}
           onError={() => {
@@ -5184,11 +6399,11 @@ function NativeRenderStage(props: {
         <img
           className="main-remote-stream"
           src={displayUrl}
-          alt="Native GS-SDF render stream"
+          alt={label}
           onLoad={() => setFrameError(null)}
         />
       ) : null}
-      {!ready || (useStream && !streamTimedOut ? !streamLoaded : !displayUrl) ? (
+      {!ready || (!useStream && !displayUrl) ? (
         <div className="main-remote-placeholder">
           {frameError ? `HiFi frame error: ${frameError}` : statusLabel}
         </div>

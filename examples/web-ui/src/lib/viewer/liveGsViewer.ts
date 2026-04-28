@@ -694,11 +694,11 @@ export class LiveGsViewer {
     const showcasePlayback = this.presentationMode === "showcase" && this.mode === "playback";
     const renderPointBudget = showcasePlayback
       ? this.interactionRenderActive
-        ? 180_000
-        : 520_000
+        ? 260_000
+        : 820_000
       : this.interactionRenderActive
-        ? 32_000
-        : 72_000;
+        ? 64_000
+        : 160_000;
     const renderCloud = showcasePlayback
       ? samplePointCloudPrioritizingColor(cloud, renderPointBudget)
       : samplePointCloudForRender(cloud, renderPointBudget);
@@ -710,9 +710,9 @@ export class LiveGsViewer {
       renderCloud,
       {
         defaultColor: "#d8ecff",
-        sizeNear: showcasePlayback ? 0.017 : 0.02,
-        sizeFar: showcasePlayback ? 0.0095 : 0.012,
-        opacity: showcasePlayback ? 0.95 : 0.98,
+        sizeNear: showcasePlayback ? 0.019 : 0.022,
+        sizeFar: showcasePlayback ? 0.011 : 0.013,
+        opacity: showcasePlayback ? 0.97 : 0.985,
         transparent: false,
         depthWrite: true,
         depthTest: true,
@@ -740,11 +740,11 @@ export class LiveGsViewer {
       cloud,
       showcasePlayback
         ? this.interactionRenderActive
-          ? 32_000
-          : 96_000
+          ? 48_000
+          : 140_000
         : this.interactionRenderActive
-          ? 4_000
-          : 10_000
+          ? 6_000
+          : 14_000
     );
     this.playbackScanPointCloudObject = this.renderPointCloudObject(
       this.playbackScanPointCloudObject,
@@ -752,8 +752,8 @@ export class LiveGsViewer {
       renderCloud,
       {
         defaultColor: "#ffd38c",
-        sizeNear: showcasePlayback ? 0.022 : 0.028,
-        sizeFar: showcasePlayback ? 0.013 : 0.018,
+        sizeNear: showcasePlayback ? 0.024 : 0.03,
+        sizeFar: showcasePlayback ? 0.014 : 0.019,
         opacity: showcasePlayback ? 0.995 : 0.84,
         transparent: showcasePlayback,
         depthWrite: !showcasePlayback,
@@ -873,15 +873,18 @@ export class LiveGsViewer {
       pose.position.y,
       pose.position.z
     );
-    this.camera.quaternion.set(
-      pose.orientation.x,
-      pose.orientation.y,
-      pose.orientation.z,
-      pose.orientation.w
-    );
 
     if (target) {
       this.orbitControls.target.set(target.x, target.y, target.z);
+      this.camera.up.set(0, 0, 1);
+      this.camera.lookAt(target.x, target.y, target.z);
+    } else {
+      this.camera.quaternion.set(
+        pose.orientation.x,
+        pose.orientation.y,
+        pose.orientation.z,
+        pose.orientation.w
+      );
     }
 
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
@@ -1895,6 +1898,14 @@ export class LiveGsViewer {
         this.sparkRenderer.minAlpha = interacting ? 0.009 : 0.0075;
         this.sparkRenderer.clipXY = 1.08;
         break;
+    }
+
+    if (this.manifest?.source?.kind === "citygaussian") {
+      this.sparkRenderer.originDistance = Math.max(this.sparkRenderer.originDistance ?? 0, interacting ? 1.22 : 1.04);
+      this.sparkRenderer.maxStdDev = Math.min(this.sparkRenderer.maxStdDev ?? Math.sqrt(5), interacting ? Math.sqrt(4.55) : Math.sqrt(4.9));
+      this.sparkRenderer.maxPixelRadius = Math.min(this.sparkRenderer.maxPixelRadius ?? 100, interacting ? 68 : 82);
+      this.sparkRenderer.minAlpha = Math.max(this.sparkRenderer.minAlpha ?? 0.01, interacting ? 0.015 : 0.012);
+      this.sparkRenderer.clipXY = Math.min(this.sparkRenderer.clipXY ?? 1.08, 1.02);
     }
   }
 }

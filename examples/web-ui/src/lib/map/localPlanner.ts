@@ -40,8 +40,9 @@ export function planPathOnGrid(input: {
   start: PlanPoint2D | null;
   goal: GoalPose2D | null;
   obstacles?: ObstacleRect2D[];
+  robotRadius?: number;
 }): LocalPlanResult {
-  const { grid, start, goal, obstacles = [] } = input;
+  const { grid, start, goal, obstacles = [], robotRadius = 0 } = input;
   if (!grid || !start || !goal) {
     return { status: "idle", path: [] };
   }
@@ -51,6 +52,7 @@ export function planPathOnGrid(input: {
     occupancy[index] = grid.data[index] === 100 ? 1 : 0;
   }
   applyObstacleRects(occupancy, grid, obstacles);
+  inflateOccupancy(occupancy, grid, robotRadius);
 
   const rawStart = worldToCell(grid, start.x, start.y);
   const rawGoal = worldToCell(grid, goal.x, goal.y);
@@ -72,11 +74,47 @@ export function planPathOnGrid(input: {
   const smoothed = smoothCellPath(route, occupancy, grid);
   const path = smoothed.map((cell) => cellCenterToWorld(grid, cell));
   if (path.length > 0) {
-    path[0] = { x: start.x, y: start.y };
-    path[path.length - 1] = { x: goal.x, y: goal.y };
+    path[0] = isFreeCell(rawStart, occupancy, grid) ? { x: start.x, y: start.y } : cellCenterToWorld(grid, startCell);
+    path[path.length - 1] = isFreeCell(rawGoal, occupancy, grid) ? { x: goal.x, y: goal.y } : cellCenterToWorld(grid, goalCell);
   }
 
   return { status: "ready", path };
+}
+
+function isFreeCell(cell: Cell, occupancy: Uint8Array, grid: OccupancyGrid): boolean {
+  return occupancy[cellToLinearIndex(grid, cell)] === 0;
+}
+
+function inflateOccupancy(occupancy: Uint8Array, grid: OccupancyGrid, robotRadius: number): void {
+  const radiusCells = Math.ceil(Math.max(0, robotRadius) / grid.resolution);
+  if (radiusCells <= 0) {
+    return;
+  }
+
+  const occupiedCells: Cell[] = [];
+  for (let y = 0; y < grid.height; y += 1) {
+    for (let x = 0; x < grid.width; x += 1) {
+      if (occupancy[y * grid.width + x]) {
+        occupiedCells.push({ x, y });
+      }
+    }
+  }
+
+  for (const cell of occupiedCells) {
+    for (let dy = -radiusCells; dy <= radiusCells; dy += 1) {
+      for (let dx = -radiusCells; dx <= radiusCells; dx += 1) {
+        if (dx * dx + dy * dy > radiusCells * radiusCells) {
+          continue;
+        }
+        const x = cell.x + dx;
+        const y = cell.y + dy;
+        if (x < 0 || y < 0 || x >= grid.width || y >= grid.height) {
+          continue;
+        }
+        occupancy[y * grid.width + x] = 1;
+      }
+    }
+  }
 }
 
 function applyObstacleRects(

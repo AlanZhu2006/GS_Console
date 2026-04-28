@@ -59,4 +59,8 @@ if [[ "${DISABLE_HIFI:-0}" != "1" ]]; then
   fi
 fi
 
+WEB_ADAPTER="${WEB_ADAPTER:-fastlivo}" \
+WEB_ROSBRIDGE_PORT="$ROSBRIDGE_PORT" \
+WEB_PLAYBACK_CONTROL_PORT="$CONTROL_PORT" \
+WEB_HIFI_BRIDGE_PORT="$HIFI_PORT" \
 bash "$ROOT_DIR/scripts/launch_web_ui_dev.sh" 0.0.0.0 "$WEB_PORT"

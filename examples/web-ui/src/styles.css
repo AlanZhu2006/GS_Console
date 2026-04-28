@@ -21,7 +21,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -162,6 +163,26 @@ input {
   cursor: pointer;
   padding: 0.2rem 0.25rem;
   white-space: nowrap;
+}
+
+.external-viewer-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2rem;
+  padding: 0.38rem 0.72rem;
+  border-radius: 999px;
+  border: 1px solid rgba(112, 184, 255, 0.32);
+  background: rgba(36, 107, 206, 0.18);
+  color: #a9d8ff;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.external-viewer-link:hover {
+  border-color: rgba(112, 184, 255, 0.58);
+  background: rgba(36, 107, 206, 0.28);
 }
 
 .endpoint span {
@@ -495,6 +516,13 @@ input {
   z-index: 2;
   opacity: 0;
   pointer-events: auto;
+}
+
+.viewer-stage.external-frame-stage .main-canvas {
+  position: relative;
+  z-index: 2;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .main-remote-surface {
@@ -925,6 +953,20 @@ input {
 .inline-value {
   color: #f3efe8;
   font-weight: 700;
+}
+
+.compact-select {
+  width: 100%;
+  min-height: 2.15rem;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 0.55rem;
+  background: rgba(255, 255, 255, 0.06);
+  color: #f3efe8;
+  padding: 0.38rem 0.55rem;
+}
+
+.compact-select:disabled {
+  color: #897f73;
 }
 
 .ghost-button {

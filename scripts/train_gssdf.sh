@@ -27,6 +27,10 @@ CONFIG_ABS="$(realpath "$CONFIG_PATH")"
 INPUT_DIR="$(dirname "$INPUT_ABS")"
 OUTPUT_DIR="$ROOT_DIR/runtime/output"
 LOG_DIR="$ROOT_DIR/runtime/logs"
+EXTRA_MOUNT_ARGS=()
+if [[ -d "/media/chatsign/data-002/datasets" ]]; then
+  EXTRA_MOUNT_ARGS+=(-v "/media/chatsign/data-002/datasets:/media/chatsign/data-002/datasets:ro")
+fi
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
 
 LOG_FILE="$LOG_DIR/${RUN_NAME}.log"
@@ -38,11 +42,16 @@ echo "Output dir: $OUTPUT_DIR"
 echo "Log file:   $LOG_FILE"
 echo "Run name:   $RUN_NAME"
 
+if [[ -f "$ROOT_DIR/scripts/prepare_gssdf_colmap_compat.py" ]]; then
+  python3 "$ROOT_DIR/scripts/prepare_gssdf_colmap_compat.py" --dataset "$INPUT_ABS"
+fi
+
 docker run --rm --name "$RUN_NAME" \
   --gpus all \
   --shm-size=16g \
   -v "$ROOT_DIR:$ROOT_DIR" \
   -v "$INPUT_DIR:$INPUT_DIR" \
+  "${EXTRA_MOUNT_ARGS[@]}" \
   -v "$OUTPUT_DIR:/root/gs_sdf_ws/src/GS-SDF/output" \
   "$IMAGE" \
   bash -lc "set -eo pipefail; \

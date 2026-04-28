@@ -1259,7 +1259,10 @@ class CachedPlaybackController:
             int(WEB_MAP_NEUTRAL_FALLBACK[2]),
         )
         frames_after_keyframe = max(0, resolved_index - restored_keyframe_index)
-        recent_fraction = min(0.45, 0.03 * float(frames_after_keyframe))
+        # Keep the accumulated map globally dense. The older version spent too much
+        # of the point budget on very recent scans, which made the current robot
+        # neighborhood look dense while already-visited areas became sparse.
+        recent_fraction = min(0.22, 0.012 * float(frames_after_keyframe))
         recent_budget = int(round(max_points * recent_fraction)) if frames_after_keyframe > 0 else 0
         keyframe_budget = max(max_points - recent_budget, 1)
         sampled_keyframe_positions, sampled_keyframe_colors, sampled_keyframe_valid_mask = (

@@ -37,8 +37,12 @@ if [[ -n "$DATA_PATH" ]]; then
     echo "Saved view config refers to missing data_path: $DATA_PATH" >&2
     exit 1
   fi
-  DATA_PARENT="$(dirname "$(realpath "$DATA_PATH")")"
-  DATA_MOUNT_ARGS=(-v "$DATA_PARENT:$DATA_PARENT")
+  DATA_PARENT_LOGICAL="$(dirname "$DATA_PATH")"
+  DATA_PARENT_RESOLVED="$(dirname "$(realpath "$DATA_PATH")")"
+  DATA_MOUNT_ARGS=(-v "$DATA_PARENT_LOGICAL:$DATA_PARENT_LOGICAL")
+  if [[ "$DATA_PARENT_RESOLVED" != "$DATA_PARENT_LOGICAL" ]]; then
+    DATA_MOUNT_ARGS+=(-v "$DATA_PARENT_RESOLVED:$DATA_PARENT_RESOLVED")
+  fi
 fi
 
 if [[ -n "$VIEW_WIDTH" || -n "$VIEW_HEIGHT" || -n "$VIEW_SCALE" ]]; then

@@ -26,7 +26,7 @@ export interface GaussianChunk {
 }
 
 export interface GaussianSource {
-  format: "gs-ply" | "spz" | "gs-chunks";
+  format: "gs-ply" | "spz" | "splat" | "gs-chunks";
   url?: string;
   chunks?: GaussianChunk[];
   shDegree: number;
@@ -41,7 +41,13 @@ export interface Pose3D {
   stampMs?: number;
 }
 
+export interface SceneInitialView {
+  pose: Pose3D;
+  target?: Vec3;
+}
+
 export interface SceneManifest {
+  schemaVersion?: string;
   sceneId: string;
   frameId: string;
   camera?: {
@@ -54,6 +60,7 @@ export interface SceneManifest {
     tCL?: number[] | null;
     tBL?: number[] | null;
   };
+  initialView?: SceneInitialView;
   gaussian?: GaussianSource;
   gaussianVariants?: Record<string, GaussianSource>;
   occupancy?: {
@@ -70,6 +77,12 @@ export interface SceneManifest {
     format: "ply" | "pcd";
     url: string;
   };
+  externalViewer?: {
+    kind?: string;
+    label?: string;
+    url: string;
+    notes?: string;
+  };
   training?: {
     status: string;
     outputDir: string;
@@ -85,6 +98,16 @@ export interface SceneManifest {
     mapSize?: number | null;
   };
   assets?: Record<string, string>;
+  source?: {
+    kind?: string;
+    outputDir?: string;
+    repoPath?: string;
+    repoCommit?: string | null;
+    visualManifestUrl?: string;
+    liveGaussianPatchMode?: "replace" | "fallback" | "disabled";
+    liveContractUrl?: string;
+    capabilityMatrixUrl?: string;
+  };
 }
 
 export interface LayerVisibility {
