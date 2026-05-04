@@ -18,6 +18,7 @@ import type { DecodedPointCloud } from "../ros/pointCloud2";
 export type ViewerMode = "live" | "playback" | "gs";
 export type GsControlMode = "orbit" | "fps";
 export type PresentationMode = "default" | "showcase";
+export type LivePointCloudRenderStyle = "cloud" | "gaussian";
 
 interface KeyboardState {
   forward: boolean;
@@ -83,6 +84,7 @@ export class LiveGsViewer {
   private mode: ViewerMode = "live";
   private gsControlMode: GsControlMode = "orbit";
   private presentationMode: PresentationMode = "default";
+  private livePointCloudRenderStyle: LivePointCloudRenderStyle = "cloud";
   /** When true in playback workspace, load Spark gaussian in-browser (cinema “Web GS”) instead of HiFi-only. */
   private playbackCompareUsesWebGs = false;
   private gaussianVariant = "balanced";
@@ -364,6 +366,14 @@ export class LiveGsViewer {
     if (this.mode === "playback" && !enabled) {
       this.framePlaybackScene();
     }
+  }
+
+  setLivePointCloudRenderStyle(style: LivePointCloudRenderStyle): void {
+    if (this.livePointCloudRenderStyle === style) {
+      return;
+    }
+    this.livePointCloudRenderStyle = style;
+    this.refreshDynamicPointClouds();
   }
 
   setGaussianVariant(variant: string | null): void {
@@ -664,10 +674,18 @@ export class LiveGsViewer {
   }
 
   private renderLivePointCloud(cloud: DecodedPointCloud): void {
+    const gaussianStyle = this.livePointCloudRenderStyle === "gaussian";
     const renderCloud = samplePointCloudForRender(
       cloud,
-      this.interactionRenderActive ? 28_000 : 72_000
+      gaussianStyle
+        ? this.interactionRenderActive
+          ? 36_000
+          : 110_000
+        : this.interactionRenderActive
+          ? 28_000
+          : 72_000
     );
+    const hadBounds = Boolean(this.livePointCloudBounds);
     const nextBounds = computePointCloudBounds(renderCloud.positions);
     this.livePointCloudObject = this.renderPointCloudObject(
       this.livePointCloudObject,
@@ -675,19 +693,24 @@ export class LiveGsViewer {
       renderCloud,
       {
         defaultColor: "#78d8ff",
-        sizeNear: 0.024,
-        sizeFar: 0.014,
-        opacity: 0.96,
-        transparent: false,
-        depthWrite: true,
-        alphaTest: 0.42,
+        sizeNear: gaussianStyle ? 0.064 : 0.024,
+        sizeFar: gaussianStyle ? 0.036 : 0.014,
+        opacity: gaussianStyle ? 0.72 : 0.96,
+        transparent: gaussianStyle,
+        depthWrite: !gaussianStyle,
+        depthTest: true,
+        alphaTest: gaussianStyle ? 0.06 : 0.42,
         crispSprite: true,
-        bounds: nextBounds
+        bounds: nextBounds,
+        renderOrder: gaussianStyle ? 18 : 0
       }
     );
     this.livePointCloudBounds = nextBounds;
     this.livePointCloudTargetCount = renderCloud.renderedPointCount;
     this.livePointCloudRevealCount = renderCloud.renderedPointCount;
+    if (this.mode === "live" && !this.followRobot && !hadBounds && nextBounds && isFiniteBox(nextBounds)) {
+      this.frameLiveScene();
+    }
   }
 
   private renderPlaybackMapPointCloud(cloud: DecodedPointCloud): void {
@@ -943,18 +966,43 @@ export class LiveGsViewer {
       };
     } catch (error) {
       console.warn("Failed to initialize Spark gaussian layer.", error);
-      const fallback = new THREE.Mesh(
-        new THREE.BoxGeometry(1.2, 1.2, 1.2),
-        new THREE.MeshStandardMaterial({
-          color: "#c78f54",
-          wireframe: true
-        })
-      );
-      fallback.position.set(0, 0, 0.6);
-      return {
-        object: fallback,
-        bounds: new THREE.Box3().setFromObject(fallback)
-      };
+      try {
+        const geometry = await loadPlyGeometry(url);
+        geometry.computeBoundingBox();
+        const useVertexColors = ensureGeometryVertexColors(geometry);
+        const fallbackPoints = new THREE.Points(
+          geometry,
+          new THREE.PointsMaterial({
+            size: 0.045,
+            color: useVertexColors ? "#ffffff" : "#d8dee6",
+            vertexColors: useVertexColors,
+            map: this.pointSpriteTexture,
+            alphaMap: this.pointSpriteTexture,
+            alphaTest: 0.35,
+            fog: false,
+            depthWrite: true,
+            transparent: false
+          })
+        );
+        return {
+          object: fallbackPoints,
+          bounds: geometry.boundingBox ?? new THREE.Box3().setFromObject(fallbackPoints)
+        };
+      } catch (fallbackError) {
+        console.warn("Failed to load gaussian PLY fallback.", fallbackError);
+        const fallback = new THREE.Mesh(
+          new THREE.BoxGeometry(1.2, 1.2, 1.2),
+          new THREE.MeshStandardMaterial({
+            color: "#c78f54",
+            wireframe: true
+          })
+        );
+        fallback.position.set(0, 0, 0.6);
+        return {
+          object: fallback,
+          bounds: new THREE.Box3().setFromObject(fallback)
+        };
+      }
     }
   }
 
@@ -1748,6 +1796,9 @@ export class LiveGsViewer {
       return false;
     }
     if (this.mode === "gs") {
+      return true;
+    }
+    if (this.mode === "live") {
       return true;
     }
     if (this.mode !== "playback") {

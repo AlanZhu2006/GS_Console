@@ -32,6 +32,7 @@ import { useNeuralMappingRos, type PlaybackCloudOptions } from "./lib/ros/useNeu
 import {
   LiveGsViewer,
   type GsControlMode,
+  type LivePointCloudRenderStyle,
   type PresentationMode,
   type ViewerMode
 } from "./lib/viewer/liveGsViewer";
@@ -459,7 +460,12 @@ export default function App() {
   const setMainCanvasRef = useCallback((node: HTMLCanvasElement | null) => {
     setMainCanvasNode(node);
   }, []);
+  const [cloudCanvasNode, setCloudCanvasNode] = useState<HTMLCanvasElement | null>(null);
+  const setCloudCanvasRef = useCallback((node: HTMLCanvasElement | null) => {
+    setCloudCanvasNode(node);
+  }, []);
   const viewerRef = useRef<LiveGsViewer | null>(null);
+  const cloudViewerRef = useRef<LiveGsViewer | null>(null);
   const [playbackResolvedMapPointCloud, setPlaybackResolvedMapPointCloud] =
     useState<DecodedPointCloud | null>(null);
 
@@ -921,6 +927,34 @@ export default function App() {
       : consoleMode === "playback"
         ? "playback"
         : "live";
+  const liveMonitorLayout = consoleMode === "live";
+  const mainViewerLayers = useMemo<LayerVisibility>(
+    () =>
+      liveMonitorLayout
+        ? {
+            gaussian: false,
+            sdfMesh: false,
+            occupancyCloud: false,
+            liveCloud: true,
+            trajectory: false,
+            robot: false
+          }
+        : layers,
+    [layers, liveMonitorLayout]
+  );
+  const cloudViewerLayers = useMemo<LayerVisibility>(
+    () => ({
+      gaussian: false,
+      sdfMesh: false,
+      occupancyCloud: false,
+      liveCloud: true,
+      trajectory: false,
+      robot: false
+    }),
+    []
+  );
+  const mainLivePointCloudRenderStyle: LivePointCloudRenderStyle =
+    liveMonitorLayout ? "gaussian" : "cloud";
   const hifiNativeRendererReady = Boolean(hifiWindowStatus?.ready || hifiStatus?.ready);
   const hifiBrowserFallbackActive = consoleMode === "hifi" && !hifiNativeRendererReady;
   const modeLabel =
@@ -2553,7 +2587,8 @@ export default function App() {
       viewer.setPresentationMode(viewerPresentationMode);
       viewer.setGsControlMode(gsControlMode);
       viewer.setGaussianVariant(activeGaussianVariant);
-      viewer.setVisibility(layers);
+      viewer.setVisibility(mainViewerLayers);
+      viewer.setLivePointCloudRenderStyle(mainLivePointCloudRenderStyle);
       viewer.setFollowRobot(effectiveFollowRobot);
       viewer.updateRobotPose(displayRobotPose);
       viewer.updateTrajectory(displayTrajectory);
@@ -2600,6 +2635,34 @@ export default function App() {
   }, [viewerMode]);
 
   useEffect(() => {
+    if (!cloudCanvasNode || !liveMonitorLayout) {
+      return;
+    }
+
+    let disposed = false;
+    try {
+      const viewer = new LiveGsViewer(cloudCanvasNode);
+      cloudViewerRef.current = viewer;
+      viewer.setMode("live");
+      viewer.setPresentationMode("default");
+      viewer.setGsControlMode("orbit");
+      viewer.setVisibility(cloudViewerLayers);
+      viewer.setLivePointCloudRenderStyle("cloud");
+      viewer.setFollowRobot(false);
+      viewer.updateLivePointCloud(rosState.livePointCloud);
+
+      return () => {
+        viewer.dispose();
+        cloudViewerRef.current = null;
+      };
+    } catch (error) {
+      console.warn("Failed to initialize live cloud inset viewer.", error);
+      cloudViewerRef.current = null;
+      return;
+    }
+  }, [cloudCanvasNode, cloudViewerLayers, liveMonitorLayout]);
+
+  useEffect(() => {
     viewerRef.current?.setPresentationMode(viewerPresentationMode);
   }, [viewerPresentationMode]);
 
@@ -2634,8 +2697,12 @@ export default function App() {
   }, [activeGaussianVariant]);
 
   useEffect(() => {
-    viewerRef.current?.setVisibility(layers);
-  }, [layers]);
+    viewerRef.current?.setVisibility(mainViewerLayers);
+  }, [mainViewerLayers]);
+
+  useEffect(() => {
+    viewerRef.current?.setLivePointCloudRenderStyle(mainLivePointCloudRenderStyle);
+  }, [mainLivePointCloudRenderStyle]);
 
   useEffect(() => {
     viewerRef.current?.setFollowRobot(effectiveFollowRobot);
@@ -2655,6 +2722,7 @@ export default function App() {
 
   useEffect(() => {
     viewerRef.current?.updateLivePointCloud(rosState.livePointCloud);
+    cloudViewerRef.current?.updateLivePointCloud(rosState.livePointCloud);
   }, [rosState.livePointCloud]);
 
   useEffect(() => {
@@ -3426,8 +3494,101 @@ export default function App() {
     setLayers((current) => sanitizeLayerVisibility(current, capabilities, consoleMode, playbackShowcase));
   }, [capabilities, consoleMode, playbackShowcase]);
 
-  const renderMapWorkspacePanel = (layout: "sidebar" | "playback-rail") => {
-    const miniMapClassName = layout === "playback-rail" ? "mini-map mini-map-playback-rail" : "mini-map";
+  const renderMapWorkspacePanel = (layout: "sidebar" | "playback-rail" | "monitor") => {
+    const miniMapClassName =
+      layout === "playback-rail"
+        ? "mini-map mini-map-playback-rail"
+        : layout === "monitor"
+          ? "mini-map mini-map-monitor"
+          : "mini-map";
+    const mapCanvas = (
+      <div className={miniMapClassName}>
+        <TopDownMap
+          manifest={manifest}
+          ros={rosState.ros}
+          liveContract={liveContract}
+          streamProfile={rosState.streamProfile}
+          robotPose={displayRobotPose}
+          trajectory={displayTrajectory}
+          mapPointCloud={playbackTopDownMapPointCloud}
+          scanPointCloud={consoleMode === "playback" ? playbackOverlayScan : null}
+          goals={goals}
+          plannedPath={plannedPath}
+          initialPose={initialPose}
+          measurements={measurements}
+          obstacles={obstacles}
+          erasures={erasures}
+          selectedTool={mapTool}
+          followRobot={effectiveFollowRobot}
+          exportRequestVersion={mapExportRequestVersion}
+          onGoal={handleMapGoal}
+          onPlannedPath={setPlannedPath}
+          onPlanningState={(status, reason) => {
+            setPlannerStatus(status);
+            setPlannerMessage(reason ?? null);
+          }}
+          onInitialPose={(pose) => setInitialPose(pose)}
+          onMeasurement={(measurement) => setMeasurements((current) => [...current.slice(-11), measurement])}
+          onObstacle={(obstacle) => setObstacles((current) => [...current.slice(-11), obstacle])}
+          onErase={(eraseRect) => setErasures((current) => [...current.slice(-11), eraseRect])}
+          onExported={(message, ok) => setMapStatusMessage(ok ? message : `Export failed: ${message}`)}
+        />
+      </div>
+    );
+
+    if (layout === "monitor") {
+      return (
+        <section className="live-monitor-inset live-monitor-map-card">
+          <div className="live-monitor-inset-header">
+            <div>
+              <div className="overlay-title">Nav2 Style Map</div>
+              <div className="live-monitor-inset-value">
+                {plannedPath.length > 1 ? `${pathLengthMeters(plannedPath).toFixed(1)} m path` : plannerStatus}
+              </div>
+            </div>
+            <label className="inline-check">
+              <input
+                type="checkbox"
+                checked={followRobot}
+                onChange={(event) => setFollowRobot(event.target.checked)}
+              />
+              <span>Follow</span>
+            </label>
+          </div>
+          <div className="live-monitor-map-toolbar">
+            <div className="segmented-control wrap">
+              {navToolOptions.map(({ tool, label, enabled, reason }) => (
+                <button
+                  key={tool}
+                  type="button"
+                  className={`segmented-option ${mapTool === tool ? "active" : ""}`}
+                  onClick={() => setMapTool(tool)}
+                  disabled={!enabled}
+                  title={enabled ? label : reason}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              className="ghost-button"
+              onClick={() => {
+                setGoals([]);
+                setPlannedPath([]);
+                setPlannerStatus("idle");
+                setPlannerMessage(null);
+                setMapStatusMessage(null);
+              }}
+            >
+              Clear
+            </button>
+          </div>
+          <div className="live-monitor-map-body">{mapCanvas}</div>
+        </section>
+      );
+    }
+
     const panelContent = (
       <>
         <div className="segmented-control wrap">
@@ -3554,38 +3715,7 @@ export default function App() {
         {plannerMessage ? <p className="hint">{plannerMessage}</p> : null}
         {mapStatusMessage ? <p className="hint">{mapStatusMessage}</p> : null}
         {consoleMode !== "playback" && navPreviewMessage ? <p className="hint">{navPreviewMessage}</p> : null}
-        <div className={miniMapClassName}>
-          <TopDownMap
-            manifest={manifest}
-            ros={rosState.ros}
-            liveContract={liveContract}
-            streamProfile={rosState.streamProfile}
-            robotPose={displayRobotPose}
-            trajectory={displayTrajectory}
-            mapPointCloud={playbackTopDownMapPointCloud}
-            scanPointCloud={consoleMode === "playback" ? playbackOverlayScan : null}
-            goals={goals}
-            plannedPath={plannedPath}
-            initialPose={initialPose}
-            measurements={measurements}
-            obstacles={obstacles}
-            erasures={erasures}
-            selectedTool={mapTool}
-            followRobot={effectiveFollowRobot}
-            exportRequestVersion={mapExportRequestVersion}
-            onGoal={handleMapGoal}
-            onPlannedPath={setPlannedPath}
-            onPlanningState={(status, reason) => {
-              setPlannerStatus(status);
-              setPlannerMessage(reason ?? null);
-            }}
-            onInitialPose={(pose) => setInitialPose(pose)}
-            onMeasurement={(measurement) => setMeasurements((current) => [...current.slice(-11), measurement])}
-            onObstacle={(obstacle) => setObstacles((current) => [...current.slice(-11), obstacle])}
-            onErase={(eraseRect) => setErasures((current) => [...current.slice(-11), eraseRect])}
-            onExported={(message, ok) => setMapStatusMessage(ok ? message : `Export failed: ${message}`)}
-          />
-        </div>
+        {mapCanvas}
         <p className="hint">
           {consoleMode === "playback"
             ? "Goal / obstacle / erase edit the exported 2D map."
@@ -3637,8 +3767,70 @@ export default function App() {
     );
   };
 
+  const renderLiveMonitorStage = () => (
+    <div className="live-monitor-stage">
+      <LiveRgbStage frame={rosState.rgbFrame} />
+      <div className="live-monitor-status-row">
+        <span className={`status-chip ${rosState.connectionState}`}>ROS {rosState.connectionState}</span>
+        <span className="overlay-chip">RGB live</span>
+        <span className="overlay-chip">
+          GS splat {rosState.livePointCloud ? "live" : "waiting"}
+        </span>
+        <span className="overlay-chip">
+          Cloud {rosState.livePointCloud ? rosState.livePointCloud.renderedPointCount.toLocaleString() : "waiting"}
+        </span>
+        <span className="overlay-chip">Pose {displayTrajectory.length}</span>
+      </div>
+      <section className="live-monitor-inset live-monitor-gs-card">
+        <div className="live-monitor-inset-header">
+          <div>
+            <div className="overlay-title">Gaussian Render</div>
+            <div className="live-monitor-inset-value">
+              {rosState.livePointCloud
+                ? `${rosState.livePointCloud.renderedPointCount.toLocaleString()} pts`
+                : mainViewSource}
+            </div>
+          </div>
+          <strong>{rosState.livePointCloud ? "live" : "idle"}</strong>
+        </div>
+        <div className="live-monitor-viewer-frame">
+          <canvas
+            key={`viewer-canvas-live-gs:${mediaSessionKey}`}
+            ref={setMainCanvasRef}
+            className="main-canvas live-monitor-render-fallback ready"
+          />
+          {!rosState.livePointCloud ? (
+            <div className="live-monitor-image-empty">Waiting for live splats</div>
+          ) : null}
+          {sceneError ? <div className="viewer-error-overlay compact">{sceneError}</div> : null}
+        </div>
+      </section>
+      <section className="live-monitor-inset live-monitor-cloud-card">
+        <div className="live-monitor-inset-header">
+          <div>
+            <div className="overlay-title">Colored Point Cloud</div>
+            <div className="live-monitor-inset-value">
+              {rosState.livePointCloud
+                ? `${rosState.livePointCloud.renderedPointCount.toLocaleString()} pts`
+                : "waiting"}
+            </div>
+          </div>
+          <strong>{rosState.livePointCloud ? "live" : "idle"}</strong>
+        </div>
+        <div className="live-monitor-viewer-frame">
+          <canvas
+            key={`viewer-canvas-live-cloud:${mediaSessionKey}`}
+            ref={setCloudCanvasRef}
+            className="main-canvas"
+          />
+        </div>
+      </section>
+      {renderMapWorkspacePanel("monitor")}
+    </div>
+  );
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${liveMonitorLayout ? "live-monitor-shell" : ""}`}>
       <header className="topbar">
         <div className="topbar-main">
           <div>
@@ -3728,12 +3920,14 @@ export default function App() {
         </div>
       </header>
 
-      <main className={`workspace ${playbackShowcase ? "showcase-playback" : ""}`}>
+      <main className={`workspace ${playbackShowcase ? "showcase-playback" : ""} ${liveMonitorLayout ? "live-monitor-workspace" : ""}`}>
         <div className="main-column">
         <section
-          className={`viewer-panel ${consoleMode === "compare" ? "compare-layout" : ""} ${playbackCinemaLayout ? "playback-cinema-layout" : ""} ${playbackShowcase ? "showcase-viewer" : ""}`}
+          className={`viewer-panel ${consoleMode === "compare" ? "compare-layout" : ""} ${playbackCinemaLayout ? "playback-cinema-layout" : ""} ${playbackShowcase ? "showcase-viewer" : ""} ${liveMonitorLayout ? "live-monitor-panel" : ""}`}
         >
-          {playbackCinemaLayout ? (
+          {liveMonitorLayout ? (
+            renderLiveMonitorStage()
+          ) : playbackCinemaLayout ? (
             <>
               <div className="playback-cinema-map-stage">
                 <div className="playback-cinema-map-overlay">
@@ -4201,6 +4395,7 @@ export default function App() {
         ) : null}
         </div>
 
+        {liveMonitorLayout ? null : (
         <aside className="sidebar">
           {!mapInPlaybackRail ? renderMapWorkspacePanel("sidebar") : null}
 
@@ -4549,6 +4744,7 @@ export default function App() {
             </InspectorSection>
           ) : null}
         </aside>
+        )}
       </main>
     </div>
   );
@@ -5049,7 +5245,7 @@ function layerPresetForMode(mode: ConsoleMode): LayerVisibility {
       };
     case "live":
       return {
-        gaussian: false,
+        gaussian: true,
         sdfMesh: true,
         occupancyCloud: true,
         liveCloud: true,
@@ -6078,6 +6274,78 @@ function InspectorSection(props: {
       </summary>
       <div className="panel-body">{props.children}</div>
     </details>
+  );
+}
+
+function LiveRgbStage(props: { frame: DecodedRosImage | null }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const frame = props.frame;
+    if (!canvas || !frame) {
+      return;
+    }
+
+    if (canvas.width !== frame.width || canvas.height !== frame.height) {
+      canvas.width = frame.width;
+      canvas.height = frame.height;
+    }
+
+    const context = canvas.getContext("2d", { alpha: false, desynchronized: true });
+    if (!context) {
+      return;
+    }
+
+    const imageData = context.createImageData(frame.width, frame.height);
+    imageData.data.set(frame.rgba);
+    context.putImageData(imageData, 0, 0);
+  }, [props.frame]);
+
+  return (
+    <div className="live-rgb-stage">
+      {props.frame ? (
+        <canvas ref={canvasRef} className="live-rgb-canvas" aria-label="Live RGB" />
+      ) : (
+        <div className="live-rgb-empty">Waiting for live RGB</div>
+      )}
+    </div>
+  );
+}
+
+function LivePollingImage(props: {
+  src: string;
+  alt: string;
+  className?: string;
+  refreshMs?: number;
+  emptyMessage?: string;
+}) {
+  const { src, alt, className, refreshMs = 1000, emptyMessage = "Waiting for image" } = props;
+  const [version, setVersion] = useState(0);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      setVersion((current) => current + 1);
+    }, refreshMs);
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [refreshMs]);
+
+  const url = `${src}${src.includes("?") ? "&" : "?"}t=${version}`;
+
+  return (
+    <>
+      <img
+        src={url}
+        alt={alt}
+        className={`${className ?? ""} ${ready ? "ready" : ""}`}
+        onLoad={() => setReady(true)}
+        onError={() => setReady(false)}
+      />
+      {!ready ? <div className="live-monitor-image-empty">{emptyMessage}</div> : null}
+    </>
   );
 }
 

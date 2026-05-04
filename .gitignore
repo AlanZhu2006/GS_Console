@@ -22,6 +22,7 @@ runtime/
 *.db3
 *.mcap
 *.zip
+optix7cache.db*
 
 # Local scene packs generated from runtime assets
 examples/web-ui/public/scenes/*

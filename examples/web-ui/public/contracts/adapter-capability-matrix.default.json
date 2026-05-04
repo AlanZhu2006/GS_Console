@@ -61,6 +61,36 @@
       }
     },
     {
+      "adapterId": "lingbot_live_ros2",
+      "displayName": "LingBot Live ROS2",
+      "sourceKind": "lingbot_live_ros2",
+      "integrationMode": "ros-live",
+      "artifacts": {
+        "gaussian": { "support": "fallback", "formats": ["gs-ply", "ply"], "notes": "The current real2sim seed gaussian PLY is loaded through Spark when compatible, otherwise as a colored point layer fallback." },
+        "mesh": { "support": "native", "formats": ["ply"] },
+        "rawPointCloud": { "support": "native", "formats": ["sensor_msgs/PointCloud2", "ply"] },
+        "trajectory": { "support": "passthrough", "formats": ["nav_msgs/Path"] },
+        "rgb": { "support": "passthrough", "formats": ["sensor_msgs/Image"] }
+      },
+      "live": {
+        "profiles": ["neural", "navigation"],
+        "transports": ["ros_topic"],
+        "inboundChannels": ["trajectory", "live_point_cloud", "rgb_frame", "playback_current_scan_world"],
+        "outboundChannels": ["nav_goal", "initial_pose", "camera_pose"],
+        "canonicalContract": "/contracts/lingbot-map-ros2-live.live-contract.json",
+        "notes": "Matches the HikRobot + LingBot command.txt live stack and exposes generated PLY scene assets through the WebUI dev server."
+      },
+      "navigation": {
+        "publishGoal": true,
+        "publishInitialPose": true,
+        "publishCameraPose": true
+      },
+      "sceneManifest": {
+        "produces": true,
+        "producerScript": "CVPR/HMR3D/nuc/scripts/sync_gs_console_monitor_assets.py"
+      }
+    },
+    {
       "adapterId": "citygaussian_import",
       "displayName": "CityGaussian Importer",
       "sourceKind": "citygaussian",
