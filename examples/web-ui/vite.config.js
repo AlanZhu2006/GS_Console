@@ -1,7 +1,7 @@
 var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _0;
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
 var nodeEnv = (_b = (_a = globalThis.process) === null || _a === void 0 ? void 0 : _a.env) !== null && _b !== void 0 ? _b : {};
 var playbackControlTarget = (_c = nodeEnv.VITE_PLAYBACK_CONTROL_TARGET) !== null && _c !== void 0 ? _c : "http://127.0.0.1:".concat((_e = (_d = nodeEnv.WEB_PLAYBACK_CONTROL_PORT) !== null && _d !== void 0 ? _d : nodeEnv.CONTROL_PORT) !== null && _e !== void 0 ? _e : "8765");
@@ -35,6 +35,10 @@ export default defineConfig({
                     }
                     var relativePath = decodeURIComponent((_b = requestUrl.slice(match.prefix.length).split("?")[0]) !== null && _b !== void 0 ? _b : "");
                     var root = resolve(match.root);
+                    if (match.prefix === livePrefix && relativePath === "rgb.mjpg") {
+                        serveMjpeg(response, request, resolve(root, "rgb_preview/latest.jpg"));
+                        return;
+                    }
                     var target = resolve(root, relativePath);
                     if (target !== root && !target.startsWith(root + sep)) {
                         response.statusCode = 403;
@@ -100,6 +104,38 @@ export default defineConfig({
         port: 4173
     }
 });
+function serveMjpeg(response, request, latestJpegPath) {
+    response.writeHead(200, {
+        "Content-Type": "multipart/x-mixed-replace; boundary=lingbotframe",
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        Pragma: "no-cache",
+        Connection: "close"
+    });
+    var closed = false;
+    var sendFrame = function () {
+        if (closed) {
+            return;
+        }
+        if (!existsSync(latestJpegPath)) {
+            return;
+        }
+        try {
+            var frame = readFileSync(latestJpegPath);
+            response.write("--lingbotframe\r\nContent-Type: image/jpeg\r\nContent-Length: ".concat(frame.length, "\r\n\r\n"));
+            response.write(frame);
+            response.write("\r\n");
+        }
+        catch (_a) {
+            // The writer may be atomically replacing the file; the next tick will retry.
+        }
+    };
+    var interval = setInterval(sendFrame, 120);
+    request.on("close", function () {
+        closed = true;
+        clearInterval(interval);
+    });
+    sendFrame();
+}
 function contentTypeForPath(path) {
     switch (extname(path).toLowerCase()) {
         case ".json":

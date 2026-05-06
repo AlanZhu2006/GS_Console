@@ -28,6 +28,7 @@ import {
 } from "./lib/ros/navGoalPublisher";
 import type { DecodedPointCloud } from "./lib/ros/pointCloud2";
 import type { DecodedRosImage } from "./lib/ros/rosImage";
+import { useBinaryPointCloudWs } from "./lib/ros/useBinaryPointCloudWs";
 import { useNeuralMappingRos, type PlaybackCloudOptions } from "./lib/ros/useNeuralMappingRos";
 import {
   LiveGsViewer,
@@ -383,6 +384,9 @@ export default function App() {
     useState<DecodedPointCloud | null>(null);
   const [playbackLocalAccumulatedPointCloud, setPlaybackLocalAccumulatedPointCloud] =
     useState<DecodedPointCloud | null>(null);
+  const [denseUpdateCount, setDenseUpdateCount] = useState(0);
+  const [liveClockMs, setLiveClockMs] = useState(() => Date.now());
+  const denseUpdateStampRef = useRef<number | null>(null);
   const playbackStreamSourcePoseRef = useRef<Pose3D | null>(null);
   const playbackHiFiPoseBusyRef = useRef(false);
   const hifiManifestCameraRef = useRef<SceneManifest["camera"] | undefined>(undefined);
@@ -799,8 +803,36 @@ export default function App() {
     }
     return DEFAULT_CAPABILITY_MATRIX_URL;
   }, [manifest?.source?.capabilityMatrixUrl, requestedCapabilityMatrixUrl, resolvedSceneUrl]);
+  const liveRgbMjpegUrl = useMemo(
+    () => (consoleMode === "live" ? "/lingbot-live-assets/live/rgb.mjpg" : ""),
+    [consoleMode]
+  );
+  const liveBinaryCloudUrl = useMemo(() => {
+    if (consoleMode !== "live") {
+      return null;
+    }
+    const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+    return `${scheme}://${window.location.hostname}:19093/cloud`;
+  }, [consoleMode]);
+  const liveGlobalBinaryCloudUrl = useMemo(() => {
+    if (consoleMode !== "live") {
+      return null;
+    }
+    const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+    return `${scheme}://${window.location.hostname}:19094/cloud`;
+  }, [consoleMode]);
+  const binaryCloudState = useBinaryPointCloudWs(liveBinaryCloudUrl);
+  const globalBinaryCloudState = useBinaryPointCloudWs(liveGlobalBinaryCloudUrl);
   const baseRosState = useNeuralMappingRos(wsUrl, {
     liveContract,
+    disableRgbFrame: Boolean(liveRgbMjpegUrl),
+    disableDepthFrame: consoleMode === "live",
+    disablePlaybackTopics: consoleMode === "live",
+    disableLivePointCloud: consoleMode === "live" && binaryCloudState.connectionState === "connected",
+    disableRos:
+      consoleMode === "live" &&
+      (liveContract?.transportHints?.preferredBridge === "http+binary-websocket" ||
+        requestedLiveContractUrl?.includes("video-playback") === true),
     playbackCloud: playbackCloudOptions,
     playbackTargetStampMs:
       consoleMode === "playback" ? playbackStatus?.currentPose?.stampMs ?? null : null
@@ -822,7 +854,7 @@ export default function App() {
       ),
     [liveContract]
   );
-  const rosState = useMemo(
+  const transportRosState = useMemo(
     () =>
       hasHttpLiveFeed
         ? {
@@ -837,6 +869,20 @@ export default function App() {
         : baseRosState,
     [baseRosState, hasHttpLiveFeed, httpLiveState]
   );
+  const rosState = useMemo(
+    () =>
+      consoleMode === "live" && binaryCloudState.cloud
+        ? {
+            ...transportRosState,
+            livePointCloud: binaryCloudState.cloud
+          }
+        : transportRosState,
+    [binaryCloudState.cloud, consoleMode, transportRosState]
+  );
+  const mainLivePointCloud =
+    consoleMode === "live" && globalBinaryCloudState.cloud
+      ? globalBinaryCloudState.cloud
+      : rosState.livePointCloud;
   const adapterCapability = useMemo(
     () => resolveAdapterCapability(capabilityMatrix, manifest?.source?.kind),
     [capabilityMatrix, manifest?.source?.kind]
@@ -928,6 +974,13 @@ export default function App() {
         ? "playback"
         : "live";
   const liveMonitorLayout = consoleMode === "live";
+  useEffect(() => {
+    if (!liveMonitorLayout) {
+      return;
+    }
+    const intervalId = window.setInterval(() => setLiveClockMs(Date.now()), 1000);
+    return () => window.clearInterval(intervalId);
+  }, [liveMonitorLayout]);
   const mainViewerLayers = useMemo<LayerVisibility>(
     () =>
       liveMonitorLayout
@@ -1161,6 +1214,22 @@ export default function App() {
       playbackResolvedMapPointCloud ||
       playbackOverlayScan
   );
+  const liveGeometryAgeSec =
+    liveMonitorLayout && rosState.livePointCloud?.stampMs
+      ? Math.max(0, (liveClockMs - rosState.livePointCloud.stampMs) / 1000)
+      : null;
+  const liveGlobalGeometryAgeSec =
+    liveMonitorLayout && mainLivePointCloud?.stampMs
+      ? Math.max(0, (liveClockMs - mainLivePointCloud.stampMs) / 1000)
+      : liveGeometryAgeSec;
+  useEffect(() => {
+    const stamp = rosState.livePointCloud?.stampMs ?? null;
+    if (!stamp || stamp === denseUpdateStampRef.current) {
+      return;
+    }
+    denseUpdateStampRef.current = stamp;
+    setDenseUpdateCount((count) => count + 1);
+  }, [rosState.livePointCloud?.stampMs]);
   const activeMapPointCloud =
     consoleMode === "playback"
       ? playbackResolvedMapPointCloud ??
@@ -2593,7 +2662,7 @@ export default function App() {
       viewer.updateRobotPose(displayRobotPose);
       viewer.updateTrajectory(displayTrajectory);
       viewer.updatePlannedPath(plannedPath);
-      viewer.updateLivePointCloud(rosState.livePointCloud);
+      viewer.updateLivePointCloud(mainLivePointCloud);
       viewer.updatePlaybackMapPointCloud(playbackResolvedMapPointCloud);
       viewer.updatePlaybackScanPointCloud(
         consoleMode === "playback" ? playbackOverlayScan : rosState.playbackScanPointCloud
@@ -2721,9 +2790,9 @@ export default function App() {
   }, [plannedPath]);
 
   useEffect(() => {
-    viewerRef.current?.updateLivePointCloud(rosState.livePointCloud);
+    viewerRef.current?.updateLivePointCloud(mainLivePointCloud);
     cloudViewerRef.current?.updateLivePointCloud(rosState.livePointCloud);
-  }, [rosState.livePointCloud]);
+  }, [mainLivePointCloud, rosState.livePointCloud]);
 
   useEffect(() => {
     viewerRef.current?.updatePlaybackMapPointCloud(playbackResolvedMapPointCloud);
@@ -2864,6 +2933,12 @@ export default function App() {
   }, [hifiActive, hifiStreamUrlBase]);
 
   useEffect(() => {
+    if (consoleMode === "live") {
+      setWorldNavStatus(null);
+      setWorldNavError(null);
+      return;
+    }
+
     let disposed = false;
 
     const load = async () => {
@@ -2904,7 +2979,7 @@ export default function App() {
       disposed = true;
       window.clearInterval(intervalId);
     };
-  }, [selectedSemanticGoal, worldNavApiUrl]);
+  }, [consoleMode, selectedSemanticGoal, worldNavApiUrl]);
 
   useEffect(() => {
     if (
@@ -3769,29 +3844,37 @@ export default function App() {
 
   const renderLiveMonitorStage = () => (
     <div className="live-monitor-stage">
-      <LiveRgbStage frame={rosState.rgbFrame} />
+      <LiveRgbStage frame={rosState.rgbFrame} mjpegSrc={liveRgbMjpegUrl} />
       <div className="live-monitor-status-row">
         <span className={`status-chip ${rosState.connectionState}`}>ROS {rosState.connectionState}</span>
         <span className="overlay-chip">RGB live</span>
         <span className="overlay-chip">
-          GS splat {rosState.livePointCloud ? "live" : "waiting"}
+          Global map {mainLivePointCloud ? "live" : "waiting"}
         </span>
         <span className="overlay-chip">
           Cloud {rosState.livePointCloud ? rosState.livePointCloud.renderedPointCount.toLocaleString() : "waiting"}
         </span>
+        <span className="overlay-chip">
+          Cloud WS {binaryCloudState.connectionState === "connected" ? "binary" : "ROS fallback"}
+        </span>
+        <span className="overlay-chip">
+          Global WS {globalBinaryCloudState.connectionState === "connected" ? "binary" : "waiting"}
+        </span>
+        <span className="overlay-chip">Geometry age {formatLatencySeconds(liveGeometryAgeSec)}</span>
+        <span className="overlay-chip">Dense updates {denseUpdateCount}</span>
         <span className="overlay-chip">Pose {displayTrajectory.length}</span>
       </div>
       <section className="live-monitor-inset live-monitor-gs-card">
         <div className="live-monitor-inset-header">
           <div>
-            <div className="overlay-title">Gaussian Render</div>
+            <div className="overlay-title">Global Map</div>
             <div className="live-monitor-inset-value">
-              {rosState.livePointCloud
-                ? `${rosState.livePointCloud.renderedPointCount.toLocaleString()} pts`
+              {mainLivePointCloud
+                ? `${mainLivePointCloud.renderedPointCount.toLocaleString()} pts · age ${formatLatencySeconds(liveGlobalGeometryAgeSec)}`
                 : mainViewSource}
             </div>
           </div>
-          <strong>{rosState.livePointCloud ? "live" : "idle"}</strong>
+          <strong>{mainLivePointCloud ? "live" : "idle"}</strong>
         </div>
         <div className="live-monitor-viewer-frame">
           <canvas
@@ -3799,8 +3882,8 @@ export default function App() {
             ref={setMainCanvasRef}
             className="main-canvas live-monitor-render-fallback ready"
           />
-          {!rosState.livePointCloud ? (
-            <div className="live-monitor-image-empty">Waiting for live splats</div>
+          {!mainLivePointCloud ? (
+            <div className="live-monitor-image-empty">Waiting for global map</div>
           ) : null}
           {sceneError ? <div className="viewer-error-overlay compact">{sceneError}</div> : null}
         </div>
@@ -3811,7 +3894,7 @@ export default function App() {
             <div className="overlay-title">Colored Point Cloud</div>
             <div className="live-monitor-inset-value">
               {rosState.livePointCloud
-                ? `${rosState.livePointCloud.renderedPointCount.toLocaleString()} pts`
+                ? `${rosState.livePointCloud.renderedPointCount.toLocaleString()} pts · age ${formatLatencySeconds(liveGeometryAgeSec)}`
                 : "waiting"}
             </div>
           </div>
@@ -5996,6 +6079,16 @@ function formatSeconds(value: number): string {
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
+function formatLatencySeconds(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return "waiting";
+  }
+  if (value < 10) {
+    return `${value.toFixed(1)}s`;
+  }
+  return `${Math.round(value)}s`;
+}
+
 function positionDistance3D(left: Pose3D, right: Pose3D): number {
   return Math.hypot(
     right.position.x - left.position.x,
@@ -6277,10 +6370,13 @@ function InspectorSection(props: {
   );
 }
 
-function LiveRgbStage(props: { frame: DecodedRosImage | null }) {
+function LiveRgbStage(props: { frame: DecodedRosImage | null; mjpegSrc?: string }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
+    if (props.mjpegSrc) {
+      return;
+    }
     const canvas = canvasRef.current;
     const frame = props.frame;
     if (!canvas || !frame) {
@@ -6300,11 +6396,13 @@ function LiveRgbStage(props: { frame: DecodedRosImage | null }) {
     const imageData = context.createImageData(frame.width, frame.height);
     imageData.data.set(frame.rgba);
     context.putImageData(imageData, 0, 0);
-  }, [props.frame]);
+  }, [props.frame, props.mjpegSrc]);
 
   return (
     <div className="live-rgb-stage">
-      {props.frame ? (
+      {props.mjpegSrc ? (
+        <img className="live-rgb-canvas" src={props.mjpegSrc} alt="" />
+      ) : props.frame ? (
         <canvas ref={canvasRef} className="live-rgb-canvas" aria-label="Live RGB" />
       ) : (
         <div className="live-rgb-empty">Waiting for live RGB</div>

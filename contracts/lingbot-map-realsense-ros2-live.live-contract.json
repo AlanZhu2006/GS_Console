@@ -1,7 +1,7 @@
 {
   "schemaVersion": "slam-adapter.live-contract/v1alpha1",
-  "contractId": "lingbot-map-ros2-live",
-  "displayName": "LingBot-Map ROS2 live RGB / cloud / Nav2 contract",
+  "contractId": "lingbot-map-realsense-ros2-live",
+  "displayName": "LingBot-Map RealSense ROS2 live RGB / cloud / Nav2 contract",
   "transportHints": {
     "preferredBridge": "rosbridge_suite",
     "defaultUrlEnv": "ROSBRIDGE_URL",
@@ -60,13 +60,13 @@
       "profile": "neural",
       "direction": "subscribe",
       "transport": "ros_topic",
-      "topic": "/hikrobot/image_raw",
+      "topic": "/camera/camera/color/image_raw",
       "messageType": "sensor_msgs/Image",
       "semanticType": "image_rgb",
       "frameIdPolicy": "message_header",
       "required": false,
       "enabledByDefault": true,
-      "rateHz": 8
+      "rateHz": 10
     },
     {
       "key": "nav_goal",

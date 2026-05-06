@@ -1,6 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
 
 const nodeEnv =
@@ -51,6 +51,10 @@ export default defineConfig({
 
           const relativePath = decodeURIComponent(requestUrl.slice(match.prefix.length).split("?")[0] ?? "");
           const root = resolve(match.root);
+          if (match.prefix === livePrefix && relativePath === "rgb.mjpg") {
+            serveMjpeg(response, request, resolve(root, "rgb_preview/latest.jpg"));
+            return;
+          }
           const target = resolve(root, relativePath);
           if (target !== root && !target.startsWith(root + sep)) {
             response.statusCode = 403;
@@ -116,6 +120,42 @@ export default defineConfig({
     port: 4173
   }
 });
+
+function serveMjpeg(
+  response: import("node:http").ServerResponse,
+  request: import("node:http").IncomingMessage,
+  latestJpegPath: string
+): void {
+  response.writeHead(200, {
+    "Content-Type": "multipart/x-mixed-replace; boundary=lingbotframe",
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    Pragma: "no-cache",
+    Connection: "close"
+  });
+  let closed = false;
+  const sendFrame = () => {
+    if (closed) {
+      return;
+    }
+    if (!existsSync(latestJpegPath)) {
+      return;
+    }
+    try {
+      const frame = readFileSync(latestJpegPath);
+      response.write(`--lingbotframe\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`);
+      response.write(frame);
+      response.write("\r\n");
+    } catch {
+      // The writer may be atomically replacing the file; the next tick will retry.
+    }
+  };
+  const interval = setInterval(sendFrame, 120);
+  request.on("close", () => {
+    closed = true;
+    clearInterval(interval);
+  });
+  sendFrame();
+}
 
 function contentTypeForPath(path: string): string {
   switch (extname(path).toLowerCase()) {

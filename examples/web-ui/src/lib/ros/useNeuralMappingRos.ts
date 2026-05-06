@@ -28,6 +28,11 @@ interface RosHookOptions {
   playbackCloud?: Partial<PlaybackCloudOptions>;
   playbackTargetStampMs?: number | null;
   liveContract?: LiveContract | null;
+  disableRgbFrame?: boolean;
+  disableDepthFrame?: boolean;
+  disablePlaybackTopics?: boolean;
+  disableLivePointCloud?: boolean;
+  disableRos?: boolean;
 }
 
 export interface RosLiveState {
@@ -115,6 +120,11 @@ export function useNeuralMappingRos(wsUrl: string, options?: RosHookOptions): Ro
   const [depthFrame, setDepthFrame] = useState<DecodedRosImage | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const liveContract = options?.liveContract ?? null;
+  const disableRgbFrame = options?.disableRgbFrame ?? false;
+  const disableDepthFrame = options?.disableDepthFrame ?? false;
+  const disablePlaybackTopics = options?.disablePlaybackTopics ?? false;
+  const disableLivePointCloud = options?.disableLivePointCloud ?? false;
+  const disableRos = options?.disableRos ?? false;
   const playbackTrajectoryRef = useRef<Pose3D[]>([]);
   const lastPlaybackPoseRef = useRef<Pose3D | null>(null);
   const latestPlaybackPoseRef = useRef<Pose3D | null>(null);
@@ -191,6 +201,13 @@ export function useNeuralMappingRos(wsUrl: string, options?: RosHookOptions): Ro
   useEffect(() => {
     let disposed = false;
     let reconnectTimer: number | null = null;
+    if (disableRos) {
+      setRos(null);
+      setConnectionState("closed");
+      setStreamProfile("idle");
+      setErrorMessage(null);
+      return;
+    }
     const client = new ROSLIB.Ros({ url: wsUrl });
     setRos(client);
     setConnectionState("connecting");
@@ -209,83 +226,101 @@ export function useNeuralMappingRos(wsUrl: string, options?: RosHookOptions): Ro
       fallbackMessageType: "nav_msgs/Path"
     });
 
-    const pointCloudTopic = createConfiguredRosTopic(client, liveContract, {
-      key: "live_point_cloud",
-      fallbackTopic: "/neural_mapping/pointcloud",
-      fallbackMessageType: "sensor_msgs/PointCloud2",
-      throttleRate: 350,
-      queueLength: 1,
-      compression: "none"
-    });
+    const pointCloudTopic = disableLivePointCloud
+      ? null
+      : createConfiguredRosTopic(client, liveContract, {
+          key: "live_point_cloud",
+          fallbackTopic: "/neural_mapping/pointcloud",
+          fallbackMessageType: "sensor_msgs/PointCloud2",
+          throttleRate: 350,
+          queueLength: 1,
+          compression: "none"
+        });
 
-    const rgbTopic = createConfiguredRosTopic(client, liveContract, {
-      key: "rgb_frame",
-      fallbackTopic: "/neural_mapping/rgb",
-      fallbackMessageType: "sensor_msgs/Image",
-      throttleRate: 250,
-      queueLength: 1,
-      compression: "none"
-    });
+    const rgbTopic = disableRgbFrame
+      ? null
+      : createConfiguredRosTopic(client, liveContract, {
+          key: "rgb_frame",
+          fallbackTopic: "/neural_mapping/rgb",
+          fallbackMessageType: "sensor_msgs/Image",
+          throttleRate: 120,
+          queueLength: 1,
+          compression: "png"
+        });
 
-    const depthTopic = createConfiguredRosTopic(client, liveContract, {
-      key: "depth_frame",
-      fallbackTopic: "/neural_mapping/depth",
-      fallbackMessageType: "sensor_msgs/Image",
-      throttleRate: 250,
-      queueLength: 1,
-      compression: "none"
-    });
+    const depthTopic = disableDepthFrame
+      ? null
+      : createConfiguredRosTopic(client, liveContract, {
+          key: "depth_frame",
+          fallbackTopic: "/neural_mapping/depth",
+          fallbackMessageType: "sensor_msgs/Image",
+          throttleRate: 250,
+          queueLength: 1,
+          compression: "none"
+        });
 
-    const playbackOdomTopic = createConfiguredRosTopic(client, liveContract, {
-      key: "playback_odometry",
-      fallbackTopic: "/aft_mapped_to_init",
-      fallbackMessageType: "nav_msgs/Odometry"
-    });
+    const playbackOdomTopic = disablePlaybackTopics
+      ? null
+      : createConfiguredRosTopic(client, liveContract, {
+          key: "playback_odometry",
+          fallbackTopic: "/aft_mapped_to_init",
+          fallbackMessageType: "nav_msgs/Odometry"
+        });
 
-    const playbackPointCloudTopic = createConfiguredRosTopic(client, liveContract, {
-      key: "playback_scan_body",
-      fallbackTopic: "/cloud_registered_body",
-      fallbackMessageType: "sensor_msgs/PointCloud2",
-      throttleRate: 150,
-      queueLength: 1,
-      compression: "none"
-    });
+    const playbackPointCloudTopic = disablePlaybackTopics
+      ? null
+      : createConfiguredRosTopic(client, liveContract, {
+          key: "playback_scan_body",
+          fallbackTopic: "/cloud_registered_body",
+          fallbackMessageType: "sensor_msgs/PointCloud2",
+          throttleRate: 150,
+          queueLength: 1,
+          compression: "none"
+        });
 
-    const playbackWebPointCloudTopic = createConfiguredRosTopic(client, liveContract, {
-      key: "playback_scan_body_web",
-      fallbackTopic: "/cloud_registered_body_web",
-      fallbackMessageType: "sensor_msgs/PointCloud2",
-      throttleRate: 45,
-      queueLength: 1,
-      compression: "none"
-    });
+    const playbackWebPointCloudTopic = disablePlaybackTopics
+      ? null
+      : createConfiguredRosTopic(client, liveContract, {
+          key: "playback_scan_body_web",
+          fallbackTopic: "/cloud_registered_body_web",
+          fallbackMessageType: "sensor_msgs/PointCloud2",
+          throttleRate: 45,
+          queueLength: 1,
+          compression: "none"
+        });
 
-    const playbackRgbTopic = createConfiguredRosTopic(client, liveContract, {
-      key: "playback_rgb",
-      fallbackTopic: "/origin_img",
-      fallbackMessageType: "sensor_msgs/Image",
-      throttleRate: 70,
-      queueLength: 1,
-      compression: "png"
-    });
+    const playbackRgbTopic = disablePlaybackTopics
+      ? null
+      : createConfiguredRosTopic(client, liveContract, {
+          key: "playback_rgb",
+          fallbackTopic: "/origin_img",
+          fallbackMessageType: "sensor_msgs/Image",
+          throttleRate: 70,
+          queueLength: 1,
+          compression: "png"
+        });
 
-    const playbackGlobalMapTopic = createConfiguredRosTopic(client, liveContract, {
-      key: "playback_global_map",
-      fallbackTopic: "/fastlivo/global_map_web",
-      fallbackMessageType: "sensor_msgs/PointCloud2",
-      throttleRate: 55,
-      queueLength: 1,
-      compression: "none"
-    });
+    const playbackGlobalMapTopic = disablePlaybackTopics
+      ? null
+      : createConfiguredRosTopic(client, liveContract, {
+          key: "playback_global_map",
+          fallbackTopic: "/fastlivo/global_map_web",
+          fallbackMessageType: "sensor_msgs/PointCloud2",
+          throttleRate: 55,
+          queueLength: 1,
+          compression: "none"
+        });
 
-    const playbackCurrentScanWorldTopic = createConfiguredRosTopic(client, liveContract, {
-      key: "playback_current_scan_world",
-      fallbackTopic: "/fastlivo/current_scan_world_web",
-      fallbackMessageType: "sensor_msgs/PointCloud2",
-      throttleRate: 35,
-      queueLength: 1,
-      compression: "none"
-    });
+    const playbackCurrentScanWorldTopic = disablePlaybackTopics
+      ? null
+      : createConfiguredRosTopic(client, liveContract, {
+          key: "playback_current_scan_world",
+          fallbackTopic: "/fastlivo/current_scan_world_web",
+          fallbackMessageType: "sensor_msgs/PointCloud2",
+          throttleRate: 35,
+          queueLength: 1,
+          compression: "none"
+        });
 
     let neuralProfileActive = false;
 
@@ -557,7 +592,7 @@ export function useNeuralMappingRos(wsUrl: string, options?: RosHookOptions): Ro
       client.close();
       setRos(null);
     };
-  }, [liveContract, reconnectToken, wsUrl]);
+  }, [disableDepthFrame, disableLivePointCloud, disablePlaybackTopics, disableRgbFrame, disableRos, liveContract, reconnectToken, wsUrl]);
 
   return useMemo(
     () => ({

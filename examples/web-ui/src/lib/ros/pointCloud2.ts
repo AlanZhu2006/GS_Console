@@ -26,6 +26,7 @@ export interface PointCloud2Message {
 export interface DecodedPointCloud {
   frameId: string;
   stampMs: number;
+  receivedAtMs?: number;
   sourcePointCount: number;
   renderedPointCount: number;
   positions: Float32Array;
@@ -58,11 +59,13 @@ export function decodePointCloud2(
   const secs = message.header?.stamp?.secs ?? 0;
   const nsecs = message.header?.stamp?.nsecs ?? 0;
   const stampMs = secs * 1000 + Math.round(nsecs / 1_000_000);
+  const receivedAtMs = Date.now();
 
   if (!sourcePointCount || !pointStep || !message.data) {
     return {
       frameId,
       stampMs,
+      receivedAtMs,
       sourcePointCount: 0,
       renderedPointCount: 0,
       positions: new Float32Array()
@@ -132,6 +135,7 @@ export function decodePointCloud2(
   return {
     frameId,
     stampMs,
+    receivedAtMs,
     sourcePointCount,
     renderedPointCount: renderedIndex,
     positions: renderedIndex === sampleCount ? positions : positions.slice(0, renderedIndex * 3),
